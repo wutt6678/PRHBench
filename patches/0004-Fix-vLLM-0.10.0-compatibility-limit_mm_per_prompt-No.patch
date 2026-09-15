@@ -1,0 +1,45 @@
+From 8c99816165de1be7506c304e222fac4eb51983dc Mon Sep 17 00:00:00 2001
+From: wutt6678 <wutt6678@gmail.com>
+Date: Tue, 15 Sep 2026 20:00:41 +0800
+Subject: [PATCH 4/4] Fix vLLM 0.10.0 compatibility: limit_mm_per_prompt None
+ -> {}
+
+Not a PRH change -- a pinned-version compatibility bug in this fork's
+own vLLM rollout wrapper, found while running GPU Gate 1 (the first real
+GRPO training attempt): vllm==0.10.0's ModelConfig (a pydantic dataclass)
+declares limit_mm_per_prompt: dict[str, int] with default_factory=dict,
+and rejects None outright:
+
+    pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig
+    limit_mm_per_prompt
+      Input should be a valid dictionary [type=dict_type, input_value=None, input_type=NoneType]
+
+vllm_rollout_spmd.py defaulted limit_mm_per_prompt to None when no
+multi-image config was set. {} is semantically identical (no multimodal
+limit applied) and is what vLLM actually expects, so use that instead.
+---
+ verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index 8f52809..f52ec37 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -134,7 +134,13 @@ class vLLMRollout(BaseRollout):
+         trust_remote_code = kwargs.get("trust_remote_code", False)
+         load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
+ 
+-        limit_mm_per_prompt = None
++        # vllm==0.10.0's ModelConfig (pydantic dataclass) declares
++        # limit_mm_per_prompt: dict[str, int] with default_factory=dict, and
++        # rejects None outright (ValidationError: "Input should be a valid
++        # dictionary"). {} is semantically identical to the old None default
++        # (no multimodal limit applied) and is accepted by every vLLM
++        # version that matters here, so use that instead of None.
++        limit_mm_per_prompt = {}
+         if config.get("limit_images", None):  # support for multi-image data
+             limit_mm_per_prompt = {"image": config.get("limit_images")}
+ 
+-- 
+2.43.0
+
