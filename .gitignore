@@ -1,0 +1,19 @@
+# The vendored upstream clone is reproduced by scripts/setup_upstream.sh
+# (clone the pinned commit + `git am` the patches/ series) rather than
+# committed wholesale -- it's a full third-party repository with its own
+# git history, license, and large bundled subpackages (pycolab, the
+# ai-safety-gridworlds suite).
+upstream/
+
+# Conda/venv environments
+.venv/
+.conda/
+
+# Python
+__pycache__/
+*.pyc
+
+# Training artifacts
+checkpoints/
+wandb/
+*.log

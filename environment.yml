@@ -1,0 +1,44 @@
+# Conda environment spec for PRHBench.
+#
+# This intentionally does NOT try to install the full upstream
+# verl-agent-safety stack (vllm, flash-attn, xformers, a pinned CUDA torch
+# build tied to a specific driver, etc. -- see upstream/requirements_safety.txt
+# for that). It captures the *minimal* set of dependencies needed to:
+#   1. run the dependency-free unit tests in tests/test_prh_reward.py, and
+#   2. run the real-stack integration smoke tests in
+#      tests/test_env_manager_integration.py (ray + gymnasium + the bundled
+#      pycolab/ai-safety-gridworlds/safe-grid-gym packages), including on
+#      GPU if one is available.
+#
+# For an actual GRPO training run (grpo_train.sh / scripts/run_phase.sh),
+# follow upstream/requirements_safety.txt (or upstream/safenv_requirements.txt)
+# instead, inside this same environment or a dedicated one -- those pull in
+# vllm, transformers, wandb, etc. and are much heavier.
+#
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate prhbench
+#   bash scripts/setup_upstream.sh   # clones + patches upstream/
+#
+# For an exact byte-for-byte reproduction of the environment this was last
+# verified in (including transitive pins), see requirements-freeze.txt
+# (`pip install -r requirements-freeze.txt` into a fresh `python=3.12` env).
+name: prhbench
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      # CPU-only by default; swap for --index-url https://download.pytorch.org/whl/cu128
+      # (or the CUDA version matching your driver) to install a GPU build instead.
+      - torch
+      - numpy==1.26.1   # pinned: the bundled pycolab/ai-safety-gridworlds code
+                        # breaks under numpy>=2.0 (see README "Known issues").
+      - omegaconf==2.3.0
+      - gymnasium==1.2.1
+      - ray==2.44.1
+      - pillow
+      - matplotlib
+      - six
+      - absl-py

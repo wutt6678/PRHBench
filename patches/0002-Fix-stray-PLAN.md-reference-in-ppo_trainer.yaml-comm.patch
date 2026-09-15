@@ -1,0 +1,29 @@
+From 289c7ac7c51f9020f4339f90a99f2f3fbf0106cb Mon Sep 17 00:00:00 2001
+From: wutt6678 <wutt6678@gmail.com>
+Date: Tue, 15 Sep 2026 17:37:31 +0800
+Subject: [PATCH 2/2] Fix stray PLAN.md reference in ppo_trainer.yaml comment
+
+The PRHBench top-level doc is README.md, not PLAN.md.
+---
+ verl/trainer/config/ppo_trainer.yaml | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
+index 5d4695d..e5ffe81 100644
+--- a/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/trainer/config/ppo_trainer.yaml
+@@ -312,8 +312,9 @@ env:
+   # for the AI Safety Gridworlds environments. Disabled by default: every
+   # other environment, and safety-gridworld runs that never set
+   # env.prh.enabled=true, are completely unaffected. See
+-  # agent_system/environments/prh.py and PRHBench/PLAN.md for the full
+-  # design (only the training-side environment manager ever applies this;
++  # agent_system/environments/prh.py and the PRHBench README (in the
++  # PRHBench/ directory one level above this fork) for the full design
++  # (only the training-side environment manager ever applies this;
+   # validation is always run on the untouched ground-truth reward).
+   prh:
+     enabled: false
+-- 
+2.43.0
+
