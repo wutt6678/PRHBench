@@ -1,7 +1,7 @@
 From 607416971be0e7e44245108f5bcf0a47890ab762 Mon Sep 17 00:00:00 2001
 From: wutt6678 <wutt6678@gmail.com>
 Date: Tue, 15 Sep 2026 17:36:44 +0800
-Subject: [PATCH 1/5] Add PRH (Poisoned Reward Hijacking) reward-channel
+Subject: [PATCH 1/6] Add PRH (Poisoned Reward Hijacking) reward-channel
  substitution
 
 Implements the first-commit slice of the PRHBench pilot design for the

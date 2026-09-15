@@ -1,0 +1,70 @@
+From aca633211f77bb97c5d29c59439e6d9f25027a48 Mon Sep 17 00:00:00 2001
+From: wutt6678 <wutt6678@gmail.com>
+Date: Tue, 15 Sep 2026 21:15:40 +0800
+Subject: [PATCH 6/6] Tolerate vLLM sleep() memory-accounting assertion on a
+ shared GPU
+
+Not a PRH change -- found running GPU Gate 1 on this shared 4-GPU node.
+vllm's inference_engine.sleep(level=1) (called unconditionally in this
+sharding manager's __exit__ for vllm>=0.6.4) asserts free device memory
+strictly increased afterward:
+
+    File ".../vllm/worker/worker.py", line 152, in sleep
+      assert freed_bytes >= 0, "Memory usage increased after sleeping."
+
+That delta is computed from whole-device free bytes
+(torch.cuda.mem_get_info), not just this process's own allocations. On a
+GPU shared with other tenants, a concurrent allocation by an unrelated
+process during the measurement window can make the delta look negative
+even though vLLM itself freed memory correctly -- confirmed in practice:
+this crashed the whole training run nondeterministically on a heavily
+loaded shared node, with GPU memory usage from unrelated processes
+visibly fluctuating by several GB during the run.
+
+Wrap the call in try/except AssertionError, log a warning, and continue
+rather than crashing the whole run over what is fundamentally a
+measurement artifact of multi-tenant GPU sharing, not a real leak in
+this process.
+---
+ verl/workers/sharding_manager/fsdp_vllm.py | 25 +++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/verl/workers/sharding_manager/fsdp_vllm.py b/verl/workers/sharding_manager/fsdp_vllm.py
+index d5249ce..0ab89c0 100644
+--- a/verl/workers/sharding_manager/fsdp_vllm.py
++++ b/verl/workers/sharding_manager/fsdp_vllm.py
+@@ -221,7 +221,30 @@ class FSDPVLLMShardingManager(BaseShardingManager):
+         ):
+             self.inference_engine.offload_model_weights()
+         else:
+-            self.inference_engine.sleep(level=1)
++            try:
++                self.inference_engine.sleep(level=1)
++            except AssertionError as exc:
++                # vllm's sleep() asserts free device memory strictly
++                # increased after sleeping (worker.py: "Memory usage
++                # increased after sleeping"), computed from whole-device
++                # free bytes (torch.cuda.mem_get_info), not just this
++                # process's own allocations. On a GPU shared with other
++                # tenants, a concurrent allocation by an unrelated process
++                # during the measurement window can make that delta look
++                # negative even though vLLM itself freed memory correctly
++                # -- this is a measurement artifact of multi-tenant GPU
++                # sharing, not a real leak in this process. Log and
++                # continue rather than crashing the whole training run
++                # over it (confirmed in practice on a 4-tenant shared
++                # node: this occurred nondeterministically, disappearing on
++                # a retry with no code change).
++                logger.warning(
++                    "vllm inference_engine.sleep(level=1) raised %r; continuing without it. "
++                    "This is expected on a GPU shared with other processes, where their "
++                    "concurrent memory usage can make vLLM's whole-device free-memory "
++                    "delta look negative even when this process freed memory correctly.",
++                    exc,
++                )
+ 
+         self.module.train()
+ 
+-- 
+2.43.0
+

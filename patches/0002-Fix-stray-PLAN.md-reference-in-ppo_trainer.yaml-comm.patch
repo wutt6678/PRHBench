@@ -1,7 +1,7 @@
 From 289c7ac7c51f9020f4339f90a99f2f3fbf0106cb Mon Sep 17 00:00:00 2001
 From: wutt6678 <wutt6678@gmail.com>
 Date: Tue, 15 Sep 2026 17:37:31 +0800
-Subject: [PATCH 2/5] Fix stray PLAN.md reference in ppo_trainer.yaml comment
+Subject: [PATCH 2/6] Fix stray PLAN.md reference in ppo_trainer.yaml comment
 
 The PRHBench top-level doc is README.md, not PLAN.md.
 ---
