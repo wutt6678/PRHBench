@@ -12,6 +12,12 @@
 #   2. AI Safety Gridworlds stack (pycolab -> ai-safety-gridworlds -> safe-grid-gym)
 #   3. requirements_safety.txt (verl/vLLM/transformers pinned set)
 #   4. upstream package itself, editable (`pip install -e .`)
+#   5. vLLM again -- requirements_safety.txt pins torch==2.8.0 explicitly,
+#      which breaks vLLM's compiled CUDA extension's ABI (confirmed: it
+#      imports fine at the top level but fails deep in the import chain
+#      verl's trainer actually uses, at trainer startup). Reinstalling
+#      vLLM restores a torch build its extension is actually compiled
+#      against, per upstream/README.md's own guidance.
 #
 # Usage:
 #   conda env create -f environment-train.yml
@@ -31,16 +37,16 @@ if [ ! -d "${UPSTREAM_DIR}" ]; then
   exit 1
 fi
 
-echo "=== [1/4] Installing vLLM==${VLLM_VERSION} first (pins torch/CUDA) ==="
+echo "=== [1/5] Installing vLLM==${VLLM_VERSION} first (pins torch/CUDA) ==="
 pip install "vllm==${VLLM_VERSION}"
 
-echo "=== [2/4] Installing the AI Safety Gridworlds stack (pycolab -> ai-safety-gridworlds -> safe-grid-gym) ==="
+echo "=== [2/5] Installing the AI Safety Gridworlds stack (pycolab -> ai-safety-gridworlds -> safe-grid-gym) ==="
 GRIDWORLDS_DIR="${UPSTREAM_DIR}/agent_system/environments/env_package/safe_gridworlds/safe-grid-gym"
 pip install -e "${GRIDWORLDS_DIR}/ai-safety-gridworlds/pycolab"
 pip install -e "${GRIDWORLDS_DIR}/ai-safety-gridworlds"
 pip install -e "${GRIDWORLDS_DIR}"
 
-echo "=== [3/4] Installing requirements_safety.txt (may reinstall/adjust torch -- vLLM will be reinstalled after if needed) ==="
+echo "=== [3/5] Installing requirements_safety.txt (may reinstall/adjust torch -- vLLM will be reinstalled after if needed) ==="
 # requirements_safety.txt is a raw `pip freeze` of the upstream authors' own
 # dev environment, so it pins THEIR editable-installed local packages as if
 # they were real PyPI releases -- verl==0.3.1.dev0, pycolab==1.2.0.dev0,
@@ -56,20 +62,34 @@ grep -vE '^(verl|pycolab|ai_safety_gridworlds|safe_grid_gym)==' "${UPSTREAM_DIR}
 pip install -r "${FILTERED_REQS}"
 rm -f "${FILTERED_REQS}"
 
-echo "=== [4/4] Installing upstream package in editable mode ==="
+echo "=== [4/5] Installing upstream package in editable mode ==="
 pip install -e "${UPSTREAM_DIR}"
 
-echo "=== Verifying vLLM's torch pin survived steps 3-4 ==="
+# requirements_safety.txt pins torch==2.8.0 explicitly (not commented out,
+# unlike vllm/numpy/flash_attn), which WILL overwrite the torch==2.7.1 that
+# vllm==0.10.0 actually needs -- confirmed in practice: vllm imports fine at
+# the top level afterwards (lazy submodules), but its compiled CUDA
+# extension is now ABI-incompatible (`vllm/_C.abi3.so: undefined symbol:
+# _ZN3c104cuda9SetDeviceEa`), which only surfaces once something actually
+# triggers the deep import chain (verl's own vllm_utils.py does, at
+# trainer startup -- a real GPU Gate 1 run failed on exactly this before
+# this step was added). So: always reinstall vLLM after steps 3-4, per
+# upstream/README.md's own guidance, rather than just warning about it.
+echo "=== [5/5] Reinstalling vLLM==${VLLM_VERSION} (requirements_safety.txt's torch==2.8.0 pin breaks vLLM's compiled CUDA extension otherwise) ==="
+pip install "vllm==${VLLM_VERSION}"
+
+echo "=== Verifying the actual import chain verl's trainer uses (not just 'import vllm') ==="
 python - <<PY
 import torch
 print("torch:", torch.__version__, "cuda available:", torch.cuda.is_available())
-try:
-    import vllm
-    print("vllm:", vllm.__version__)
-except Exception as exc:
-    print("WARNING: vllm import failed after full install:", exc)
-    print("Per upstream/README.md, reinstall vllm now: pip install vllm==${VLLM_VERSION}")
+# Exercises the same deep import chain as verl/utils/vllm_utils.py ->
+# vllm.lora.models -> ... -> vllm.platforms.cuda -> vllm._C, which a bare
+# "import vllm" does NOT trigger (lazy submodules) and so does not catch
+# an ABI mismatch between vllm's compiled extension and whatever torch
+# ended up installed.
+from vllm.lora.models import LoRAModel  # noqa: F401
+import vllm
+print("vllm:", vllm.__version__, "-- deep import chain OK")
 PY
 
-echo "=== Done. If torch was downgraded by step 3/4, reinstall vLLM: ==="
-echo "    pip install vllm==${VLLM_VERSION}"
+echo "=== Done: vLLM's compiled CUDA extension verified against the installed torch build. ==="
