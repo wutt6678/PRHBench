@@ -41,7 +41,20 @@ pip install -e "${GRIDWORLDS_DIR}/ai-safety-gridworlds"
 pip install -e "${GRIDWORLDS_DIR}"
 
 echo "=== [3/4] Installing requirements_safety.txt (may reinstall/adjust torch -- vLLM will be reinstalled after if needed) ==="
-pip install -r "${UPSTREAM_DIR}/requirements_safety.txt"
+# requirements_safety.txt is a raw `pip freeze` of the upstream authors' own
+# dev environment, so it pins THEIR editable-installed local packages as if
+# they were real PyPI releases -- verl==0.3.1.dev0, pycolab==1.2.0.dev0,
+# ai_safety_gridworlds==0.1.0, safe_grid_gym==0.1. None of those exact dev
+# versions exist on PyPI (confirmed: `pip install verl==0.3.1.dev0` fails
+# outright, aborting the whole requirements.txt install since pip resolves
+# it as one unit). All four are already installed from local source by step
+# 2 (the gridworld packages) and step 4 below (`pip install -e .`, this
+# repo's own pyproject.toml declares its package name as "verl"), so filter
+# them out here rather than editing the vendored file.
+FILTERED_REQS="$(mktemp)"
+grep -vE '^(verl|pycolab|ai_safety_gridworlds|safe_grid_gym)==' "${UPSTREAM_DIR}/requirements_safety.txt" > "${FILTERED_REQS}"
+pip install -r "${FILTERED_REQS}"
+rm -f "${FILTERED_REQS}"
 
 echo "=== [4/4] Installing upstream package in editable mode ==="
 pip install -e "${UPSTREAM_DIR}"
