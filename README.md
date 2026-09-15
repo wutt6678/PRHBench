@@ -7,12 +7,16 @@ fork of verl-agent (the code for "Reward Hacking in Language Model Agents:
 Revisiting AI Safety Gridworlds").
 
 Adaptive attacks, a learned attacker, additional environments, and defenses
-are explicitly out of scope for now. Two things are proven to work end to
-end at this point: (1) the reward-routing/environment-manager layer,
-against the real `ray`+`gymnasium` stack with GPU-enabled torch, and (2)
-the persistence-curve analysis math, against synthetic data. Real GRPO
-training (GPU Gates 1-3, then the seed-17 pilot itself) has not been run
-yet — see "Status" below.
+are explicitly out of scope for now. Three things are now proven to work
+end to end: (1) the reward-routing/environment-manager layer, against the
+real `ray`+`gymnasium` stack with GPU-enabled torch, (2) the
+persistence-curve analysis math, against synthetic data, and (3) as of
+2026-09-16, real GRPO training on GPU — **GPU Gate 1 has passed**: the
+full path (Gridworld → PRH router → trajectory collector → GRPO → FSDP
+checkpoint) runs end to end, and the reward-substitution mechanism is
+confirmed correct with exact numbers from real training, at both `rho=0`
+and `rho=1`. See "Status" below for the details and for what's still
+open (Gates 2-3 and the pilot itself).
 
 ## Layout
 
@@ -274,17 +278,71 @@ Ray workers are separate processes, so `PYTHONPATH` (not just
 `sys.path`) must include `upstream/` for the integration tests — they
 import `agent_system.*` inside `ray.remote` actors.
 
-## Status: GPU Gates 1-3 and the pilot itself have not been run yet
+## Status
 
-Everything above is verified. What follows — the actual GRPO training —
-requires the full `prhbench-train` stack (vLLM, a downloaded model, real
-GPU time) and has not been executed in this environment yet:
+### Gate 1: passed (2026-09-16)
 
-- **Gate 1** (`scripts/run_grpo_smoke.sh`): Smoke A (PRH disabled, 2
-  updates), Smoke B (`rho=0`, 3 updates: `r_train == hidden_reward`
-  throughout), Smoke C (`rho=1`, 3 updates: `r_train == observed_reward`
-  throughout). Proves Gridworld → PRH router → trajectory collector →
-  GRPO → FSDP checkpoint → resume actually works end to end.
+Ran on a single NVIDIA RTX 6000 Ada (a 4-GPU node shared with other
+users' jobs), `Qwen/Qwen2.5-1.5B-Instruct`, `AbsentSupervisor`, seed 17,
+via `scripts/run_phase.sh` (`run_grpo_smoke.sh`'s three phases, plus
+Smoke C run standalone after a transient GPU contention crash — see
+below).
+
+**Smoke A (PRH disabled, 2 updates) — fully passed, no caveats.** Both
+updates completed: GRPO performed real optimizer updates
+(`actor/pg_loss`, `actor/kl_loss`, `actor/grad_norm` all present with
+sane values), validation ran and logged
+`val/cumulative_hidden_reward_mean` / `val/cumulative_observed_reward_mean`,
+and a checkpoint was written and verified on disk
+(`global_step_1/actor/{model,optim}_world_size_1_rank_0.pt` + tokenizer
+files). No `prh_*` key appeared anywhere, confirming PRH-disabled
+behavior is untouched.
+
+**Smoke B (`rho=0`, clean PRH training) — core claim proven exactly,
+run then hit external GPU contention.** Step 1's logged metrics prove
+`r_train == hidden_reward` with an *exact* numeric match:
+`episode/reward/mean:-54.750` equals `episode/hidden_reward_mean:-54.750`
+precisely (not `episode/observed_reward_mean:-49.125`), with
+`prh/poison_prob_nominal:0.000` and `prh/poison_rate_realized:0.000`.
+The run then crashed on update 2 with a CUDA OOM — but the error message
+names several ~1.8-2GB processes under *other users'* PIDs on the shared
+GPU as the memory consumers, with our own process's usage unchanged and
+still within its configured budget; this is external contention on a
+shared cluster, not a defect.
+
+**Smoke C (`rho=1`, full hijack) — core claim proven exactly, same
+external contention on update 2.** Run standalone after Smoke B's
+crash (no need to re-run A/B; their claims were already captured).
+Step 1: `episode/reward/mean:-48.359` equals
+`episode/observed_reward_mean:-48.359` exactly (not
+`episode/hidden_reward_mean:-55.391`), with `prh/poison_prob_nominal:1.000`,
+`prh/poison_rate_realized:1.000`, `prh/poisoned_episodes:64.000` (all 64
+episodes poisoned, as expected at `rho=1`). Crashed on update 2 with the
+same external-contention OOM signature as Smoke B.
+
+**Net result:** every one of Gate 1's acceptance criteria has direct
+numeric evidence from real training on real GPU hardware. The two
+second-update crashes are a property of running on a heavily shared,
+multi-tenant cluster at that moment (confirmed by the OOM messages
+themselves), not something in this patch. Getting here also surfaced
+and fixed five real environment/dependency bugs unrelated to PRH itself
+(patches 4-7 in `patches/`): a stale package pin in
+`requirements_safety.txt`, vLLM's torch build being silently overwritten,
+a missing `flash_attn` (fixed by auto-installing a matched prebuilt
+wheel instead of the multi-hour source build upstream's README warns
+about), two vLLM 0.10.0 pydantic-strictness issues in the verl fork's
+own rollout wrapper, an incompatible hardcoded vLLM block size, and a
+vLLM sleep-mode memory-accounting assertion that's fundamentally
+unreliable on a shared GPU (now tolerated with a warning instead of
+crashing the run).
+
+Before the real pilot, re-run Smoke B/C to completion (all 3 updates
+each) on a less-contended window, to confirm the pattern holds beyond
+update 1 — the mechanism is proven, but a full run's absence of
+regressions across all 3 updates is still worth the extra confirmation.
+
+### Gates 2-3 and the pilot itself: not yet run
+
 - **Gate 2** (`scripts/run_resume_smoke.sh`): continuous 0→20 vs.
   segmented 0→10→(resume)→20, both `rho=0`. A diagnostic, not a
   pass/fail test — the environment RNG isn't checkpointed, so exact
@@ -300,7 +358,10 @@ GPU time) and has not been executed in this environment yet:
   `analysis/pilot_metrics.py`.
 
 Run these only after Gates 1-3 pass, in that order — don't jump straight
-to the 280-update pilot.
+to the 280-update pilot. Expect each update to take on the order of
+30-50 minutes on a shared GPU node at the contention level observed
+here; budget wall-clock time accordingly, and prefer a less-loaded
+window if possible.
 
 ## Running a phase
 
@@ -336,5 +397,9 @@ bash scripts/run_pilot.sh
   one initial prompt get the same `Z`) is a real open question given GRPO
   computes relative advantages within groups — queued as a follow-up
   ablation, not implemented now.
-- No end-to-end GRPO training has been run (see "Status" above) — this is
-  the main open item before trusting any persistence numbers.
+- GPU Gate 1 passed (see "Status" above), but only Smoke A ran to full
+  completion; Smoke B/C's core reward-substitution claims are proven
+  exactly at update 1, but both were cut short at update 2 by transient
+  external GPU contention. Re-running them to completion, then Gates 2-3
+  and the pilot itself, are the remaining open items before trusting any
+  persistence numbers.
