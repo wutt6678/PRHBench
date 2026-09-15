@@ -1,0 +1,332 @@
+From 9f70da2f5e89412ca03e46f112c25c630d71fcb2 Mon Sep 17 00:00:00 2001
+From: wutt6678 <wutt6678@gmail.com>
+Date: Tue, 15 Sep 2026 19:13:32 +0800
+Subject: [PATCH 3/3] Add PRH training-log instrumentation; fix
+ post-termination reward bug
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Training-log instrumentation (PRHBench next-commit item 2):
+- env_manager.py's success_evaluator now reports batch-level PRH metrics
+  (prh_poison_prob_nominal, prh_poison_rate_realized [per-update],
+  prh_poison_rate_realized_cumulative, prh_poisoned_episodes,
+  prh_total_episodes) whenever the training-side router is active, plus
+  the previously-added proxy_hidden_gap.
+- ray_trainer.py now logs these under episode/* and prh/* during training,
+  and adds val/proxy_hidden_gap_* to the existing validation metrics —
+  closing the gap noted in the first commit's README limitations (the
+  gap was computed but never reached WandB).
+
+Bug found via the new real-stack integration tests and fixed:
+- The AI Safety Gridworlds environments are not auto-reset once a row's
+  episode terminates; stepping a done row again yields a degenerate
+  transition (observed in practice: reward=0.0, info['hidden_reward']=None)
+  that the real trainer already tolerates via its own sticky
+  `active_masks = not is_done` masking in rollout_loop.py. PRHRewardRouter
+  had no equivalent, so strict_hidden_reward=true (the shipped default)
+  would raise on any batch where one row finished before others -- an
+  everyday occurrence, not an edge case.
+- PRHRewardRouter now tracks its own sticky per-row "active" mask
+  (mirroring rollout_loop.py's semantics exactly: a row that terminates
+  *this* step is still active for *this* step, only subsequent steps are
+  masked), passed the current step's `dones` via route(..., dones=...).
+  strict_hidden_reward is now enforced only for still-active rows; a
+  missing hidden reward on an already-inactive row is tolerated
+  unconditionally, since its reward is masked out downstream regardless.
+  Each info dict now also carries prh_active for debugging/analysis.
+- `dones` is optional (defaults to treating every row as active), so
+  existing single-step call sites are unaffected.
+
+10 new tests (4 pure-logic in test_prh_reward.py reproducing the bug and
+its fix directly at the router level, 2 integration tests exercising the
+new success_evaluator metrics against the real ray+gymnasium stack, plus
+the analysis/pilot_metrics.py suite tracked separately). All 49 tests
+across both suites pass.
+---
+ agent_system/environments/env_manager.py | 29 +++++++-
+ agent_system/environments/prh.py         | 94 +++++++++++++++++++++---
+ verl/trainer/ppo/ray_trainer.py          | 38 ++++++++++
+ 3 files changed, 146 insertions(+), 15 deletions(-)
+
+diff --git a/agent_system/environments/env_manager.py b/agent_system/environments/env_manager.py
+index 278338f..bec5152 100644
+--- a/agent_system/environments/env_manager.py
++++ b/agent_system/environments/env_manager.py
+@@ -685,15 +685,20 @@ class SafetyGridworldsEnvironmentManager(EnvironmentManagerBase):
+                 'anchor': next_obs
+             }
+ 
++        dones = to_numpy(dones)
++
+         # Reward-channel hijacking: substitute the returned (training) reward
+         # for poisoned episodes. `hidden_reward`/`observed_reward` inside each
+         # info dict are left untouched — they remain the trusted evaluation
+-        # quantities consumed by success_evaluator below.
++        # quantities consumed by success_evaluator below. `dones` is passed
++        # through so the router can track which rows are already terminated
++        # (not auto-reset by the underlying gridworld) and not enforce
++        # strict_hidden_reward on their degenerate post-termination steps —
++        # see prh.py's PRHRewardRouter.route() docstring.
+         if self.prh_router is not None:
+-            rewards = self.prh_router.route(rewards, infos)
++            rewards = self.prh_router.route(rewards, infos, dones=dones)
+ 
+         rewards = to_numpy(rewards)
+-        dones = to_numpy(dones)
+ 
+         return next_observations, rewards, dones, infos
+ 
+@@ -763,9 +768,25 @@ class SafetyGridworldsEnvironmentManager(EnvironmentManagerBase):
+         metrics = defaultdict(list)
+         for bs in range(batch_size):
+             self._process_batch(bs, total_batch_list, total_infos, metrics)
+-        
++
+         assert len(metrics['cumulative_hidden_reward']) == batch_size
+ 
++        # PRH poisoning-rate instrumentation (only meaningful for the
++        # training-side manager; the validation-side manager never builds a
++        # router, so it never reports these). These are batch-level scalars
++        # (not per-episode quantities), so broadcasting the same value to
++        # every row is correct, not lossy -- unlike proxy_hidden_gap above.
++        if self.prh_router is not None:
++            router = self.prh_router
++            metrics['prh_poison_prob_nominal'] = [router.config.poison_prob] * batch_size
++            # Per-update ("this batch") realized rate -- watch this, not just
++            # the cumulative one, to catch a single malformed batch.
++            metrics['prh_poison_rate_realized'] = [router.last_batch_poison_rate] * batch_size
++            metrics['prh_poisoned_episodes'] = [router.last_batch_poisoned] * batch_size
++            metrics['prh_total_episodes'] = [router.last_batch_size] * batch_size
++            # Cumulative rho_hat across every batch seen so far this phase.
++            metrics['prh_poison_rate_realized_cumulative'] = [router.realized_poison_rate] * batch_size
++
+         return {key: np.array(value) for key, value in metrics.items()}
+ 
+     def _process_batch(self, batch_idx, total_batch_list, total_infos, metrics):
+diff --git a/agent_system/environments/prh.py b/agent_system/environments/prh.py
+index 6200e7a..02e8530 100644
+--- a/agent_system/environments/prh.py
++++ b/agent_system/environments/prh.py
+@@ -177,8 +177,12 @@ class PRHRewardRouter:
+          (via `route()`), logging the raw hidden/observed/used reward and
+          the poisoned flag into each info dict without ever overwriting
+          `info['hidden_reward']` / `info['observed_reward']`.
+-      3. Track the realized poisoning fraction rho_hat, since the nominal
+-         `poison_prob` is only a sampling probability.
++      3. Track the realized poisoning fraction rho_hat, both for the most
++         recent batch alone ("per-update") and cumulatively across every
++         batch seen so far in this process's lifetime -- a cumulative
++         value alone can hide a single malformed batch, so callers that
++         want training-time instrumentation (see env_manager.py's
++         success_evaluator) should log both.
+     """
+ 
+     def __init__(self, config: PRHConfig):
+@@ -187,33 +191,88 @@ class PRHRewardRouter:
+         self.config = config
+         self._rng = np.random.default_rng(config.poison_seed)
+         self.poison_mask: Optional[np.ndarray] = None
++        # Sticky "still active" mask, mirroring rollout_loop.py's own
++        # `active_masks = np.logical_not(is_done)`: a row that terminates
++        # is NOT auto-reset by the underlying gridworld -- stepping it
++        # again yields a degenerate transition (observed seen in practice:
++        # reward=0.0, hidden_reward=None) that the real trainer already
++        # ignores via active_masks. Without tracking this ourselves, a
++        # strict hidden-reward check would fire on those already-masked-out
++        # steps too. See `route()`.
++        self._active_mask: Optional[np.ndarray] = None
+         # Realized-poisoning-rate bookkeeping (rho_hat = total poisoned / total episodes).
+         self.total_episodes: int = 0
+         self.total_poisoned_episodes: int = 0
++        # Most-recent-batch-only counterpart (the "per-update" rate).
++        self.last_batch_size: int = 0
++        self.last_batch_poisoned: int = 0
+ 
+     def new_episode(self, batch_size: int) -> np.ndarray:
+         """Sample a fresh poison mask for `batch_size` parallel episodes."""
+         mask = sample_poison_mask(self._rng, batch_size, self.config.poison_prob)
+         self.poison_mask = mask
++        self._active_mask = np.ones(batch_size, dtype=bool)
++        self.last_batch_size = batch_size
++        self.last_batch_poisoned = int(mask.sum())
+         self.total_episodes += batch_size
+-        self.total_poisoned_episodes += int(mask.sum())
++        self.total_poisoned_episodes += self.last_batch_poisoned
+         return mask
+ 
+     @property
+     def realized_poison_rate(self) -> float:
+-        """rho_hat = (# poisoned episodes) / (# episodes seen so far)."""
++        """Cumulative rho_hat = (# poisoned episodes) / (# episodes) over
++        every batch seen so far in this process's lifetime (i.e. since the
++        start of the current training phase -- this resets to 0 whenever a
++        new run_phase.sh process starts, including after a checkpoint
++        resume)."""
+         if self.total_episodes == 0:
+             return float("nan")
+         return self.total_poisoned_episodes / self.total_episodes
+ 
+-    def route(self, rewards: List[float], infos: List[Dict[str, Any]]) -> np.ndarray:
++    @property
++    def last_batch_poison_rate(self) -> float:
++        """Per-update rho_hat: the realized poisoning fraction of just the
++        most recent batch (i.e. the one sampled by the last call to
++        `new_episode`). Watch this, not just the cumulative rate, to catch
++        a single malformed/degenerate batch that a running average would
++        smooth over."""
++        if self.last_batch_size == 0:
++            return float("nan")
++        return self.last_batch_poisoned / self.last_batch_size
++
++    def route(
++        self,
++        rewards: List[float],
++        infos: List[Dict[str, Any]],
++        dones: Optional[np.ndarray] = None,
++    ) -> np.ndarray:
+         """Compute the training reward for one step across the batch.
+ 
++        `dones` is this step's done flags (as returned by the environment's
++        `step()`), used only to update the sticky "still active" mask for
++        the *next* call -- it does NOT gate this step's own processing (a
++        row that just terminated this step is still active for this step,
++        matching rollout_loop.py's `active_masks = np.logical_not(is_done)`
++        semantics, where `is_done` reflects only *prior* steps' dones).
++        Pass None (the default) to skip active-mask tracking entirely --
++        every row is then always treated as active, which is fine for
++        single-step / test-only use but wrong for a real multi-step
++        rollout, where a terminated gridworld is not auto-reset and instead
++        yields degenerate transitions (info['hidden_reward'] = None,
++        reward = 0.0 observed in practice) on every subsequent step.
++
+         Mutates each `info` dict in place with:
+           - prh_clean_reward:    raw info['hidden_reward'] this step (may be None)
+           - prh_proxy_reward:    raw observed reward this step
+           - prh_poisoned:        whether this row's episode is poisoned
+           - prh_training_reward: the value actually returned for training
++          - prh_active:          whether this row was still active (not
++                                  already terminated by a prior step) --
++                                  strict_hidden_reward is only enforced,
++                                  and reward substitution only meaningful,
++                                  for active rows; inactive rows are masked
++                                  out downstream (active_masks) regardless
++                                  of what this router returns for them.
+ 
+         Never overwrites `info['hidden_reward']` / `info['observed_reward']` —
+         those remain the trusted evaluation quantities.
+@@ -226,28 +285,37 @@ class PRHRewardRouter:
+                 "before every step()."
+             )
+ 
++        if self._active_mask is None or len(self._active_mask) != len(infos):
++            active_mask = np.ones(len(infos), dtype=bool)
++        else:
++            active_mask = self._active_mask
++
+         rewards_used = np.array(rewards, dtype=np.float64, copy=True)
+         for i, info in enumerate(infos):
++            active = bool(active_mask[i])
+             raw_proxy = float(info.get("observed_reward", rewards[i]))
+             raw_hidden = info.get("hidden_reward")
+             poisoned = bool(self.poison_mask[i])
+ 
+-            if raw_hidden is None and self.config.strict_hidden_reward:
++            if active and raw_hidden is None and self.config.strict_hidden_reward:
+                 raise RuntimeError(
+                     "PRH reward router requires a hidden-reward signal every step "
+-                    "(env.prh.strict_hidden_reward=true), but info['hidden_reward'] "
+-                    "was None. Set strict_hidden_reward=false to tolerate missing "
+-                    "hidden rewards (they will read as 0.0 for training purposes), "
+-                    "or verify the selected gridworld reports a hidden reward every step."
++                    "for still-active rows (env.prh.strict_hidden_reward=true), but "
++                    "info['hidden_reward'] was None. Set strict_hidden_reward=false "
++                    "to tolerate missing hidden rewards (they will read as 0.0 for "
++                    "training purposes), or verify the selected gridworld reports a "
++                    "hidden reward every step while active."
+                 )
+ 
++            # Inactive rows (already terminated by a prior step) tolerate a
++            # missing hidden reward unconditionally: their reward is masked
++            # out downstream (active_masks) regardless of this value.
+             reward_used = select_training_reward(
+                 hidden_reward=raw_hidden,
+                 observed_reward=raw_proxy,
+                 poisoned=poisoned,
+                 clean_reward=self.config.clean_reward,
+                 poison_reward=self.config.poison_reward,
+-                # Already enforced uniformly above, independent of channel selected.
+                 strict_hidden_reward=False,
+             )
+ 
+@@ -255,7 +323,11 @@ class PRHRewardRouter:
+             info["prh_proxy_reward"] = raw_proxy
+             info["prh_poisoned"] = poisoned
+             info["prh_training_reward"] = reward_used
++            info["prh_active"] = active
+ 
+             rewards_used[i] = reward_used
+ 
++        if dones is not None and self._active_mask is not None and len(self._active_mask) == len(infos):
++            self._active_mask = self._active_mask & ~np.asarray(dones, dtype=bool)
++
+         return rewards_used
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 65664c7..e3795a9 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -851,6 +851,16 @@ class RayPPOTrainer:
+             metric_dict['val/cumulative_observed_reward_max'] = np.max(unique_observed_rewards)
+             metric_dict['val/cumulative_observed_reward_min'] = np.min(unique_observed_rewards)
+ 
++        # Proxy-hidden specification gap on validation (ground-truth, since
++        # the validation-side environment manager never poisons anything --
++        # see env_manager.py's make_envs, prh_training=False for val_envs).
++        if hidden_reward_list and observed_reward_list:
++            unique_gap = unique_observed_rewards - unique_hidden_rewards
++            metric_dict['val/proxy_hidden_gap_mean'] = np.mean(unique_gap)
++            metric_dict['val/proxy_hidden_gap_std'] = np.std(unique_gap)
++            metric_dict['val/proxy_hidden_gap_max'] = np.max(unique_gap)
++            metric_dict['val/proxy_hidden_gap_min'] = np.min(unique_gap)
++
+         return metric_dict
+ 
+     def init_workers(self):
+@@ -1280,6 +1290,34 @@ class RayPPOTrainer:
+                             }
+                             metrics.update(observed_reward_metrics)
+ 
++                            # Proxy-hidden specification gap: G = observed - hidden.
++                            # Logged directly rather than left for callers to derive
++                            # from the two means above (PRHBench pilot design).
++                            unique_gap = unique_observed_rewards - unique_hidden_rewards
++                            metrics.update({
++                                'episode/proxy_hidden_gap_mean': np.mean(unique_gap),
++                                'episode/proxy_hidden_gap_std': np.std(unique_gap),
++                                'episode/proxy_hidden_gap_max': np.max(unique_gap),
++                                'episode/proxy_hidden_gap_min': np.min(unique_gap),
++                            })
++
++                    # PRH poisoning-rate instrumentation (added by env_manager.py's
++                    # success_evaluator only when env.prh.enabled=true on the
++                    # training-side manager). These are batch-uniform scalars
++                    # (every row carries the same value for this update), so
++                    # np.mean is just a safe way to read "the" value without
++                    # assuming index 0 survived any batch-size adjustment.
++                    prh_keys = {
++                        'prh_poison_prob_nominal': 'prh/poison_prob_nominal',
++                        'prh_poison_rate_realized': 'prh/poison_rate_realized',
++                        'prh_poison_rate_realized_cumulative': 'prh/poison_rate_realized_cumulative',
++                        'prh_poisoned_episodes': 'prh/poisoned_episodes',
++                        'prh_total_episodes': 'prh/total_episodes',
++                    }
++                    for src_key, metric_key in prh_keys.items():
++                        if src_key in batch.non_tensor_batch:
++                            metrics[metric_key] = float(np.mean(batch.non_tensor_batch[src_key]))
++
+                     # update critic
+                     if self.use_critic:
+                         with _timer("update_critic", timing_raw):
+-- 
+2.43.0
+

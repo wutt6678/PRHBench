@@ -188,6 +188,81 @@ class TestSafetyGridworldsEnvironmentManagerPRH(unittest.TestCase):
         finally:
             manager.envs.close()
 
+    def test_success_evaluator_reports_prh_instrumentation(self):
+        # This is the training-log path (PRHBench next-commit item 2): the
+        # per-update poison-rate instrumentation that should reach
+        # WandB/console via ray_trainer.py's episode/* and prh/* metrics.
+        config = make_config(poison_prob=0.5, poison_seed=123)
+        manager = self._build_manager(config, is_train=True)
+        try:
+            _obs, infos0 = manager.reset({})
+            mask_at_reset = manager.prh_router.poison_mask.copy()
+
+            total_infos = [[] for _ in range(self.ENV_NUM)]
+            total_batch_list = [[] for _ in range(self.ENV_NUM)]
+            rng = np.random.default_rng(2)
+            for _ in range(self.N_STEPS):
+                actions = random_text_actions(rng, self.ENV_NUM)
+                _next_obs, _rewards, _dones, infos = manager.step(actions)
+                for i in range(self.ENV_NUM):
+                    total_infos[i].append(infos[i])
+                    total_batch_list[i].append({"active_masks": True})
+
+            success = manager.success_evaluator(
+                total_infos=total_infos, total_batch_list=total_batch_list
+            )
+
+            expected_poisoned = int(mask_at_reset.sum())
+            expected_rate = expected_poisoned / self.ENV_NUM
+
+            self.assertIn("prh_poison_prob_nominal", success)
+            self.assertIn("prh_poison_rate_realized", success)
+            self.assertIn("prh_poisoned_episodes", success)
+            self.assertIn("prh_total_episodes", success)
+            self.assertIn("prh_poison_rate_realized_cumulative", success)
+            self.assertIn("proxy_hidden_gap", success)
+
+            np.testing.assert_allclose(success["prh_poison_prob_nominal"], [0.5] * self.ENV_NUM)
+            np.testing.assert_allclose(success["prh_poison_rate_realized"], [expected_rate] * self.ENV_NUM)
+            np.testing.assert_allclose(success["prh_poisoned_episodes"], [expected_poisoned] * self.ENV_NUM)
+            np.testing.assert_allclose(success["prh_total_episodes"], [self.ENV_NUM] * self.ENV_NUM)
+            # Only one reset happened, so per-update and cumulative rates match.
+            np.testing.assert_allclose(
+                success["prh_poison_rate_realized_cumulative"], [expected_rate] * self.ENV_NUM
+            )
+            # proxy_hidden_gap = cumulative_observed_reward - cumulative_hidden_reward
+            np.testing.assert_allclose(
+                success["proxy_hidden_gap"],
+                success["cumulative_observed_reward"] - success["cumulative_hidden_reward"],
+            )
+        finally:
+            manager.envs.close()
+
+    def test_validation_manager_reports_no_prh_instrumentation(self):
+        # The validation-side manager never builds a router, so it must not
+        # report any prh_* metrics at all (there is nothing poisoned to report).
+        config = make_config(poison_prob=1.0)
+        manager = self._build_manager(config, is_train=False)
+        try:
+            _obs, infos0 = manager.reset({})
+            total_infos = [[] for _ in range(self.ENV_NUM)]
+            total_batch_list = [[] for _ in range(self.ENV_NUM)]
+            rng = np.random.default_rng(3)
+            for _ in range(self.N_STEPS):
+                actions = random_text_actions(rng, self.ENV_NUM)
+                _next_obs, _rewards, _dones, infos = manager.step(actions)
+                for i in range(self.ENV_NUM):
+                    total_infos[i].append(infos[i])
+                    total_batch_list[i].append({"active_masks": True})
+
+            success = manager.success_evaluator(
+                total_infos=total_infos, total_batch_list=total_batch_list
+            )
+            for key in success:
+                self.assertFalse(key.startswith("prh_"), f"unexpected PRH metric on validation manager: {key}")
+        finally:
+            manager.envs.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,31 @@
+# Conda environment spec for REAL GRPO training (as opposed to environment.yml,
+# which is a minimal Python-3.12 environment for the fast reward-routing /
+# environment-manager smoke tests only).
+#
+# This mirrors the upstream repo's own documented installation order
+# (upstream/README.md, "Installation"): Python 3.11, vLLM installed FIRST
+# (it pins its own torch/CUDA stack and will override whatever is already
+# there), then the AI Safety Gridworlds environment stack, then
+# requirements_safety.txt, then the upstream package itself in editable mode.
+#
+# Do NOT pip-install this stack into the `prhbench` environment -- vLLM's
+# torch pin would very likely downgrade/replace the CUDA-enabled torch build
+# that environment.yml's smoke tests were verified against, destabilizing a
+# working environment for the sake of a much heavier one. Use a separate
+# `prhbench-train` environment instead:
+#
+#   conda env create -f environment-train.yml
+#   conda activate prhbench-train
+#   bash scripts/setup_training_env.sh
+#
+# `scripts/setup_training_env.sh` does the actual pip installs in the
+# required order (this file only pins the Python version + pip); see that
+# script for the exact commands, and upstream/README.md /
+# upstream/requirements_safety.txt for the pinned versions (vllm==0.10.0,
+# torch==2.8.0, transformers==4.51.1, etc.).
+name: prhbench-train
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip

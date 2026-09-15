@@ -70,7 +70,9 @@ echo "# Phase 1/3 -- shared pre-attack checkpoint (rho=0, seed=${SEED})"
 echo "############################################################"
 env "${common_env[@]}" \
   EXPERIMENT_NAME="${pre_experiment}" \
+  PHASE_NAME=pre \
   TOTAL_EPOCHS="${PRE_EPOCHS}" \
+  START_STEP=0 \
   PRH_ENABLED=true \
   PRH_POISON_PROB=0.0 \
   bash "${HERE}/run_phase.sh"
@@ -85,6 +87,7 @@ for dose in ${DOSES}; do
   echo "############################################################"
   env "${common_env[@]}" \
     EXPERIMENT_NAME="${attack_experiment}" \
+    PHASE_NAME=attack \
     TOTAL_EPOCHS="${ATTACK_EPOCHS}" \
     PRH_ENABLED=true \
     PRH_POISON_PROB="${dose}" \
@@ -96,6 +99,7 @@ for dose in ${DOSES}; do
   echo "############################################################"
   env "${common_env[@]}" \
     EXPERIMENT_NAME="${washout_experiment}" \
+    PHASE_NAME=washout \
     TOTAL_EPOCHS="${WASHOUT_EPOCHS}" \
     PRH_ENABLED=true \
     PRH_POISON_PROB=0.0 \

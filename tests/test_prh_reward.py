@@ -198,6 +198,58 @@ class TestPRHRewardRouter(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             router.route(rewards=[2.0], infos=infos)
 
+    def test_missing_hidden_reward_tolerated_on_row_already_done(self):
+        # Reproduces a real behavior of the underlying gridworld (see
+        # tests/test_env_manager_integration.py): once a row terminates, it
+        # is not auto-reset, and stepping it again yields hidden_reward=None
+        # even though strict_hidden_reward=true. That degenerate row is
+        # masked out downstream via active_masks, so the router must not
+        # raise for it once `dones` has marked it inactive.
+        router = self._router(poison_prob=0.0, strict=True)
+        router.new_episode(batch_size=2)
+
+        # Step 1: row 0 terminates, row 1 keeps going -- both still report
+        # a real hidden reward this step, so nothing should raise yet.
+        infos_step1 = [
+            {"hidden_reward": 49.0, "observed_reward": 49.0},
+            {"hidden_reward": -1.0, "observed_reward": -1.0},
+        ]
+        router.route(rewards=[49.0, -1.0], infos=infos_step1, dones=np.array([True, False]))
+        self.assertTrue(infos_step1[0]["prh_active"])
+        self.assertTrue(infos_step1[1]["prh_active"])
+
+        # Step 2: row 0 (already done) degenerates to hidden_reward=None;
+        # row 1 (still active) keeps reporting a real hidden reward. This
+        # must NOT raise, and row 0 must be reported as inactive.
+        infos_step2 = [
+            {"hidden_reward": None, "observed_reward": 0.0},
+            {"hidden_reward": -1.0, "observed_reward": -1.0},
+        ]
+        used = router.route(rewards=[0.0, -1.0], infos=infos_step2, dones=np.array([False, False]))
+        self.assertFalse(infos_step2[0]["prh_active"])
+        self.assertTrue(infos_step2[1]["prh_active"])
+        self.assertEqual(used[0], 0.0)  # tolerated fallback for the inactive row
+        self.assertEqual(used[1], -1.0)  # unaffected: still active, rho=0 -> hidden
+
+    def test_still_active_row_with_missing_hidden_reward_still_raises(self):
+        # The tolerance above is specifically for already-inactive rows --
+        # a still-active row missing its hidden reward is exactly the
+        # original failure mode strict_hidden_reward is meant to catch.
+        router = self._router(poison_prob=0.0, strict=True)
+        router.new_episode(batch_size=1)
+        infos = [{"hidden_reward": None, "observed_reward": 1.0}]
+        with self.assertRaises(RuntimeError):
+            router.route(rewards=[1.0], infos=infos, dones=np.array([False]))
+
+    def test_route_without_dones_treats_every_row_as_active(self):
+        # Omitting `dones` (e.g. single-step ad hoc use) must preserve the
+        # original strict behavior: every row is treated as active.
+        router = self._router(poison_prob=0.0, strict=True)
+        router.new_episode(batch_size=1)
+        infos = [{"hidden_reward": None, "observed_reward": 1.0}]
+        with self.assertRaises(RuntimeError):
+            router.route(rewards=[1.0], infos=infos)
+
 
 class TestPRHConfig(unittest.TestCase):
     def test_disabled_when_env_has_no_prh_node(self):

@@ -6,26 +6,36 @@ observed proxy reward, on top of the [`asparius/verl-agent-safety`](https://gith
 fork of verl-agent (the code for "Reward Hacking in Language Model Agents:
 Revisiting AI Safety Gridworlds").
 
-This is the **first commit** of the pilot design: config + poison mask +
-reward substitution + logging + tests + a three-phase runner. Adaptive
-attacks, a learned attacker, additional environments, and defenses are
-explicitly out of scope for now.
+Adaptive attacks, a learned attacker, additional environments, and defenses
+are explicitly out of scope for now. Two things are proven to work end to
+end at this point: (1) the reward-routing/environment-manager layer,
+against the real `ray`+`gymnasium` stack with GPU-enabled torch, and (2)
+the persistence-curve analysis math, against synthetic data. Real GRPO
+training (GPU Gates 1-3, then the seed-17 pilot itself) has not been run
+yet — see "Status" below.
 
 ## Layout
 
 ```
 PRHBench/
-├── environment.yml        conda env spec for the dedicated `prhbench` environment
+├── environment.yml         conda env for the lightweight `prhbench` smoke-test environment (Python 3.12)
+├── environment-train.yml   conda env for the real-training `prhbench-train` environment (Python 3.11)
 ├── requirements-freeze.txt  exact pip freeze of a verified `prhbench` environment
-├── patches/                git-am-able patch series (the diff applied to upstream/)
+├── patches/                 git-am-able patch series (the diff applied to upstream/)
+├── analysis/
+│   └── pilot_metrics.py     H/O/G curves, matched deltas, P-AUC, recovery half-life
 ├── scripts/
-│   ├── setup_upstream.sh   clones the pinned upstream commit + applies patches/
-│   ├── run_phase.sh        one training phase (pre-attack / attack / washout)
-│   └── run_pilot.sh        orchestrates all three phases across poison doses
+│   ├── setup_upstream.sh     clones the pinned upstream commit + applies patches/
+│   ├── setup_training_env.sh installs the real training stack (vLLM first, per upstream's own docs)
+│   ├── run_phase.sh          one training phase (pre-attack / attack / washout), writes a run manifest
+│   ├── run_pilot.sh          orchestrates all three phases across poison doses
+│   ├── run_grpo_smoke.sh     GPU Gate 1: tiny end-to-end smoke (disabled / rho=0 / rho=1)
+│   └── run_resume_smoke.sh   GPU Gate 2: continuous-vs-segmented resume diagnostic
 ├── tests/
 │   ├── test_prh_reward.py               pure-logic unit tests (no torch/ray required)
-│   └── test_env_manager_integration.py  real-stack integration smoke tests (ray+gymnasium)
-├── upstream/                (gitignored) verl-agent-safety fork, recreated by setup_upstream.sh
+│   ├── test_env_manager_integration.py  real-stack integration smoke tests (ray+gymnasium)
+│   └── test_pilot_metrics.py            persistence-curve math, against synthetic data
+├── upstream/                 (gitignored) verl-agent-safety fork, recreated by setup_upstream.sh
 └── README.md
 ```
 
@@ -36,23 +46,36 @@ it fresh at the pinned commit and reapplies our changes from `patches/`,
 which is the standard way to track a small patch against someone else's
 tree without vendoring it.
 
-## Setup
+## Two environments, not one
+
+- **`prhbench`** (`environment.yml`, Python 3.12) — the lightweight
+  environment the test suites below actually run in: `torch`, `ray`,
+  `gymnasium`, `omegaconf`, plus the three bundled gridworld packages
+  installed in editable mode. GPU-capable (verified with a CUDA 12.8
+  torch build against 4x NVIDIA RTX 6000 Ada), but never installs vLLM.
+- **`prhbench-train`** (`environment-train.yml`, Python 3.11) — for real
+  GRPO training. Kept **separate** from `prhbench` on purpose: vLLM pins
+  its own torch/CUDA build and will override whatever is already
+  installed, so piling the full training stack onto the working
+  `prhbench` environment risks destabilizing it for no benefit (the test
+  suites don't need vLLM at all). Installed via
+  `scripts/setup_training_env.sh`, which follows upstream's own
+  documented order exactly: **vLLM first** (`vllm==0.10.0`), then the
+  gridworld packages, then `requirements_safety.txt`, then the upstream
+  package itself in editable mode.
 
 ```bash
+# Smoke-test environment (this is what the commands below assume):
 conda env create -f environment.yml
 conda activate prhbench
 bash scripts/setup_upstream.sh
-```
 
-This creates a dedicated `prhbench` conda environment (Python 3.12) with
-just enough installed to run both test suites below — `torch`, `ray`,
-`gymnasium`, `omegaconf`, plus the three bundled gridworld packages
-(`pycolab`, `ai-safety-gridworlds`, `safe-grid-gym`) installed in editable
-mode from inside `upstream/`. It is deliberately **not** the full
-`upstream/requirements_safety.txt` stack (vllm, flash-attn, xformers, a
-pinned CUDA build) needed for actual GRPO training — see that file (or
-`upstream/safenv_requirements.txt`) when you're ready to run
-`scripts/run_phase.sh` / `scripts/run_pilot.sh` for real.
+# Real-training environment (separate, only needed for GPU Gates 1-3 / the pilot):
+conda env create -f environment-train.yml
+conda activate prhbench-train
+bash scripts/setup_upstream.sh   # if not already done
+bash scripts/setup_training_env.sh
+```
 
 `environment.yml` installs a CPU or CUDA build of `torch` depending on
 your pip config; on a GPU box, install the CUDA build explicitly first
@@ -85,10 +108,26 @@ installed. It implements:
   samples a fresh mask at every `reset()` (held fixed for the whole
   episode), and on every `step()` selects the training reward per row,
   logging `prh_clean_reward` / `prh_proxy_reward` / `prh_poisoned` /
-  `prh_training_reward` into each info dict **without ever overwriting**
-  `info['hidden_reward']` / `info['observed_reward']`. Also tracks the
-  realized poisoning fraction `rho_hat` (the nominal `poison_prob` is only
-  a sampling probability).
+  `prh_training_reward` / `prh_active` into each info dict **without ever
+  overwriting** `info['hidden_reward']` / `info['observed_reward']`. Also
+  tracks the realized poisoning fraction `rho_hat`, both per-update (the
+  most recent batch alone) and cumulatively across the training phase
+  (the nominal `poison_prob` is only a sampling probability, and a
+  cumulative average alone can hide a single malformed batch).
+
+**Bug found and fixed via real-stack integration testing:** the AI Safety
+Gridworlds environments are not auto-reset once a row's episode
+terminates — stepping a done row again yields a degenerate transition
+(observed in practice: `reward=0.0`, `info['hidden_reward']=None`), which
+the real trainer already tolerates via its own sticky
+`active_masks = not is_done` masking in `rollout_loop.py`. The router now
+tracks the same sticky per-row "active" state (fed `dones` via
+`route(..., dones=...)`) and only enforces `strict_hidden_reward` for
+still-active rows; an already-terminated row's missing hidden reward is
+tolerated unconditionally, since its reward is masked out downstream
+regardless. This was not a hypothetical edge case — it reproduces on
+essentially any multi-step batch where rows finish at different times,
+which is the common case, not a rare one.
 
 `agent_system/environments/env_manager.py` wires this into
 `SafetyGridworldsEnvironmentManager`:
@@ -100,12 +139,27 @@ installed. It implements:
   computed on the untouched ground-truth reward**, regardless of
   `env.prh.enabled`.
 - `reset()` — samples a fresh poison mask via `router.new_episode(batch_size)`.
-- `step()` — routes the reward through `router.route(rewards, infos)` before
-  returning it to the RL trainer.
-- `success_evaluator` / `_process_batch` — adds a `proxy_hidden_gap =
-  cumulative_observed_reward - cumulative_hidden_reward` metric per episode
-  (NaN when no hidden-reward data was available, consistent with how
-  `cumulative_hidden_reward` already handles missing data).
+- `step()` — routes the reward through `router.route(rewards, infos, dones=dones)`
+  before returning it to the RL trainer.
+- `success_evaluator` / `_process_batch` — adds, per episode/batch:
+  `proxy_hidden_gap` (`cumulative_observed_reward - cumulative_hidden_reward`,
+  NaN when no hidden-reward data was available); and, whenever the
+  training-side router is active, the batch-level poisoning-rate
+  instrumentation described below.
+
+`verl/trainer/ppo/ray_trainer.py` now logs, in addition to the
+already-existing `episode/hidden_reward_*` / `episode/observed_reward_*`
+and `val/cumulative_hidden_reward_*` / `val/cumulative_observed_reward_*`:
+
+| Metric | When | Meaning |
+|---|---|---|
+| `episode/proxy_hidden_gap_mean/std/max/min` | training | `O - H` per unique trajectory this update |
+| `val/proxy_hidden_gap_mean/std/max/min` | validation | same, on ground-truth validation rewards |
+| `prh/poison_prob_nominal` | training, PRH enabled | the configured `rho` |
+| `prh/poison_rate_realized` | training, PRH enabled | **per-update** realized `rho_hat` (this batch only) |
+| `prh/poison_rate_realized_cumulative` | training, PRH enabled | cumulative `rho_hat` across the whole phase so far |
+| `prh/poisoned_episodes` | training, PRH enabled | poisoned-episode count, this update |
+| `prh/total_episodes` | training, PRH enabled | total-episode count, this update (sanity check against a malformed batch) |
 
 `verl/trainer/config/ppo_trainer.yaml` gets a new `env.prh` block
 (`enabled: false` by default):
@@ -126,6 +180,57 @@ With `enabled: false` (the default), behavior is bit-for-bit identical to
 upstream: no other environment, and no existing safety-gridworld run that
 doesn't set `env.prh.enabled=true`, is affected by this patch.
 
+## Deterministic validation for this pilot
+
+`grpo_train.sh` hard-codes stochastic validation
+(`val_kwargs.temperature=0.4`, `do_sample=True`). For a persistence
+curve, that's unnecessary measurement noise, so `scripts/run_phase.sh`
+appends (Hydra/OmegaConf CLI overrides resolve last-value-wins, and these
+land after `grpo_train.sh`'s own fixed values):
+
+```
+actor_rollout_ref.rollout.val_kwargs.temperature=0
+actor_rollout_ref.rollout.val_kwargs.do_sample=False
+actor_rollout_ref.rollout.val_kwargs.n=1
+```
+
+by default (`DETERMINISTIC_VAL=true`; set to `false` to fall back to
+upstream's stochastic default). A stochastic-evaluation sensitivity check
+(e.g. `n=4`) is a follow-up for the proper benchmark, not part of the
+first pilot.
+
+## Run manifest
+
+Every phase (`run_phase.sh`) writes `prhbench_manifest.json` into its
+checkpoint directory *before* training starts:
+
+```json
+{
+  "prhbench_commit": "...",
+  "upstream_commit": "5e20440...",
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "environment": "AbsentSupervisor",
+  "phase": "attack",
+  "experiment_name": "rho0.25_s17",
+  "project_name": "prhbench_pilot",
+  "parent_checkpoint": ".../global_step_40",
+  "start_step": 40,
+  "end_step": 60,
+  "rho_nominal": 0.25,
+  "prh_enabled": true,
+  "poison_seed": 10017,
+  "env_seed": 17,
+  "deterministic_val": true,
+  "n_gpus": 2,
+  "created_at": "..."
+}
+```
+
+`start_step` is inferred from a `.../global_step_<N>` `RESUME_FROM` path
+when not given explicitly. Validated (dry-run against a stub trainer, both
+a fresh-start and a resumed case) to produce well-formed JSON with correct
+field values before ever touching a GPU.
+
 ## Tests
 
 ```bash
@@ -134,46 +239,82 @@ export PYTHONPATH="$(pwd)/upstream"
 python3 -m unittest discover -s tests -v
 ```
 
-**28 tests, all passing** (verified in the `prhbench` conda environment
+**49 tests, all passing** (verified in the `prhbench` conda environment
 with GPU-enabled torch, on 2026-09-15):
 
-- **`test_prh_reward.py`** (22 tests) — pure `prh.py` logic, loaded
+- **`test_prh_reward.py`** (26 tests) — pure `prh.py` logic, loaded
   directly by file path so it runs with zero ML dependencies installed:
   `poison_prob=0` → always hidden reward, `poison_prob=1` → always
   observed reward, realized poisoning ≈ nominal at `poison_prob=0.25`,
   the mask is constant across steps within an episode, changing
   `poison_seed` changes only the mask, `hidden_reward`/`observed_reward`
-  are never overwritten, and a missing hidden reward raises under
-  `strict_hidden_reward=true` (including on a poisoned row) but is
-  tolerated (reads as `0.0`) when `strict_hidden_reward=false`.
-- **`test_env_manager_integration.py`** (6 tests) — the same invariants
+  are never overwritten, a missing hidden reward raises under
+  `strict_hidden_reward=true` for a still-active row but is tolerated for
+  an already-terminated one (the post-termination bug above, reproduced
+  and fixed at the router level), and tolerated everywhere when
+  `strict_hidden_reward=false`.
+- **`test_env_manager_integration.py`** (8 tests) — the same invariants
   exercised through the *real* `SafetyGridworldsEnvironmentManager`
   against the actual `AbsentSupervisor` gridworld, via real `ray` actors
   and `gymnasium`: `poison_prob=0`/`1` training-reward equivalence, the
-  validation-side manager ignoring `poison_prob` entirely, mask
-  constancy across steps, realized-rate accuracy, and
-  `env.prh.enabled=false` reproducing plain upstream behavior bit for bit.
+  validation-side manager ignoring `poison_prob` entirely (and reporting
+  no `prh_*` metrics at all), mask constancy across steps, realized-rate
+  accuracy, `env.prh.enabled=false` reproducing plain upstream behavior
+  bit for bit, and the new `success_evaluator` poisoning-rate
+  instrumentation matching hand-computed expectations.
+- **`test_pilot_metrics.py`** (16 tests) — the persistence-curve math
+  (`analysis/pilot_metrics.py`) against synthetic records reproducing the
+  pilot design's own worked example (`Delta_H` shrinking from 15 to 2
+  across the washout window, half-recovering at k=20): matched deltas,
+  P-AUC sign conventions, the recovery half-life (including the
+  "never recovers, report `> max(k)`, don't extrapolate" case), and error
+  handling (missing checkpoints, unsorted `k`, duplicate records).
 
 Ray workers are separate processes, so `PYTHONPATH` (not just
 `sys.path`) must include `upstream/` for the integration tests — they
 import `agent_system.*` inside `ray.remote` actors.
 
-## Running the pilot (requires a GPU node with the full upstream stack installed)
+## Status: GPU Gates 1-3 and the pilot itself have not been run yet
 
-Single phase:
+Everything above is verified. What follows — the actual GRPO training —
+requires the full `prhbench-train` stack (vLLM, a downloaded model, real
+GPU time) and has not been executed in this environment yet:
+
+- **Gate 1** (`scripts/run_grpo_smoke.sh`): Smoke A (PRH disabled, 2
+  updates), Smoke B (`rho=0`, 3 updates: `r_train == hidden_reward`
+  throughout), Smoke C (`rho=1`, 3 updates: `r_train == observed_reward`
+  throughout). Proves Gridworld → PRH router → trajectory collector →
+  GRPO → FSDP checkpoint → resume actually works end to end.
+- **Gate 2** (`scripts/run_resume_smoke.sh`): continuous 0→20 vs.
+  segmented 0→10→(resume)→20, both `rho=0`. A diagnostic, not a
+  pass/fail test — the environment RNG isn't checkpointed, so exact
+  reproduction isn't expected; only similar learning curves and final
+  validation reward are.
+- **Gate 3**: ~40 updates of `rho=0` training alone, to establish
+  `H(t)` (hidden reward) actually improves before there's anything
+  meaningful for an attacker to hijack. Go/no-go: `H(40) > H(0)` by a
+  practically meaningful amount.
+- **The pilot itself**: `run_pilot.sh` with `rho ∈ {0, 0.25, 1.0}`,
+  seed 17, `40 clean + 20 attack + 60 washout` (280 total updates, since
+  the first 40 are shared across doses), analyzed with
+  `analysis/pilot_metrics.py`.
+
+Run these only after Gates 1-3 pass, in that order — don't jump straight
+to the 280-update pilot.
+
+## Running a phase
 
 ```bash
 ENV_NAME=AbsentSupervisor MODEL_PATH=Qwen/Qwen2.5-1.5B-Instruct SEED=17 \
-PROJECT_NAME=prhbench_pilot EXPERIMENT_NAME=pre_s17 \
+PROJECT_NAME=prhbench_pilot EXPERIMENT_NAME=pre_s17 PHASE_NAME=pre \
 TOTAL_EPOCHS=40 SAVE_FREQ=5 TEST_FREQ=5 \
 PRH_ENABLED=true PRH_POISON_PROB=0.0 PRH_POISON_SEED=10017 \
 bash scripts/run_phase.sh
 ```
 
 All three phases (pre-attack → attack → washout) for the seed-17 dose
-sweep `{0, 0.25, 1.0}` from section 15 of the pilot design, sharing one
-pre-attack checkpoint per seed and resuming actor+optimizer state across
-phases (section 12-13):
+sweep, sharing one pre-attack checkpoint per seed and resuming
+actor+optimizer state across phases:
 
 ```bash
 ENV_NAME=AbsentSupervisor MODEL_PATH=Qwen/Qwen2.5-1.5B-Instruct \
@@ -182,27 +323,18 @@ bash scripts/run_pilot.sh
 ```
 
 `HF_TOKEN` must be set (required by `grpo_train.sh`), and `N_GPUS` /
-`CONDA_ENV` should be overridden to match the target node. This step
-needs the *full* upstream stack (vllm, transformers, wandb, ...), not
-just the minimal `prhbench` environment used for the smoke tests above.
+`CONDA_ENV` should be overridden to match the target node. Use the
+`prhbench-train` environment for all of this, not `prhbench`.
 
 ## Known limitations / deferred work
 
-- `proxy_hidden_gap` is exposed through `success_evaluator`'s existing
-  generic per-episode metric path, but is **not** wired into the PPO
-  trainer's WandB scalar logging the way `cumulative_hidden_reward` /
-  `cumulative_observed_reward` are (that path is hardcoded in
-  `verl/trainer/ppo/ray_trainer.py` and was left untouched to keep this
-  first patch minimal). Downstream analysis should derive the gap from
-  the already-logged `val/cumulative_hidden_reward_mean` and
-  `val/cumulative_observed_reward_mean` instead.
 - Only `poison_unit: episode` is implemented; `PRHConfig` raises
   `NotImplementedError` for anything else.
-- The smoke tests cover the environment-manager/reward-routing layer end
-  to end (real ray + gymnasium, GPU-capable torch confirmed working), but
-  **not** an actual GRPO training step — that needs the full vllm/verl
-  stack and a downloaded model, which is a much larger, separate task.
-  Before a real launch, also run the resume-from-checkpoint fidelity
-  check from the pilot design (a `rho=0` branch resumed from step 40
-  should track an uninterrupted 120-step clean run) — this requires the
-  actual trainer and isn't covered by either test suite here.
+- Trajectory-level poisoning (the current design: each of a GRPO group's
+  rollouts can independently land on either side of the reward-channel
+  substitution) vs. group-level poisoning (all members of a group sharing
+  one initial prompt get the same `Z`) is a real open question given GRPO
+  computes relative advantages within groups — queued as a follow-up
+  ablation, not implemented now.
+- No end-to-end GRPO training has been run (see "Status" above) — this is
+  the main open item before trusting any persistence numbers.
