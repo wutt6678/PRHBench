@@ -9,6 +9,10 @@
 #
 # Usage:
 #   HF_TOKEN=... N_GPUS=2 bash PRHBench/scripts/run_grpo_smoke.sh
+#   # extra Hydra overrides (e.g. a lower gpu_memory_utilization on a
+#   # shared/contended GPU) are forwarded to every phase:
+#   HF_TOKEN=... bash PRHBench/scripts/run_grpo_smoke.sh \
+#     actor_rollout_ref.rollout.gpu_memory_utilization=0.25
 #
 # Requires the FULL training stack (prhbench-train environment: see
 # environment-train.yml / scripts/setup_training_env.sh), not the
@@ -34,7 +38,7 @@ ENV_NAME="${ENV_NAME}" MODEL_PATH="${MODEL_PATH}" SEED="${SEED}" N_GPUS="${N_GPU
 PROJECT_NAME="${PROJECT_NAME}" EXPERIMENT_NAME="smoke_a_disabled" PHASE_NAME="smoke_a" \
 TOTAL_EPOCHS=2 SAVE_FREQ=1 TEST_FREQ=1 \
 PRH_ENABLED=false \
-bash "${HERE}/run_phase.sh"
+bash "${HERE}/run_phase.sh" "$@"
 
 echo "################################################################"
 echo "# Smoke B -- clean PRH training (rho=0), 3 updates"
@@ -47,7 +51,7 @@ ENV_NAME="${ENV_NAME}" MODEL_PATH="${MODEL_PATH}" SEED="${SEED}" N_GPUS="${N_GPU
 PROJECT_NAME="${PROJECT_NAME}" EXPERIMENT_NAME="smoke_b_rho0" PHASE_NAME="smoke_b" \
 TOTAL_EPOCHS=3 SAVE_FREQ=1 TEST_FREQ=1 \
 PRH_ENABLED=true PRH_POISON_PROB=0.0 PRH_POISON_SEED=10017 \
-bash "${HERE}/run_phase.sh"
+bash "${HERE}/run_phase.sh" "$@"
 
 echo "################################################################"
 echo "# Smoke C -- full hijack (rho=1), 3 updates"
@@ -59,7 +63,7 @@ ENV_NAME="${ENV_NAME}" MODEL_PATH="${MODEL_PATH}" SEED="${SEED}" N_GPUS="${N_GPU
 PROJECT_NAME="${PROJECT_NAME}" EXPERIMENT_NAME="smoke_c_rho1" PHASE_NAME="smoke_c" \
 TOTAL_EPOCHS=3 SAVE_FREQ=1 TEST_FREQ=1 \
 PRH_ENABLED=true PRH_POISON_PROB=1.0 PRH_POISON_SEED=10017 \
-bash "${HERE}/run_phase.sh"
+bash "${HERE}/run_phase.sh" "$@"
 
 echo "################################################################"
 echo "# Gate 1 complete. Manually check for each run:"
