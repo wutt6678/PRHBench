@@ -1,7 +1,7 @@
 From 8c99816165de1be7506c304e222fac4eb51983dc Mon Sep 17 00:00:00 2001
 From: wutt6678 <wutt6678@gmail.com>
 Date: Tue, 15 Sep 2026 20:00:41 +0800
-Subject: [PATCH 4/4] Fix vLLM 0.10.0 compatibility: limit_mm_per_prompt None
+Subject: [PATCH 4/5] Fix vLLM 0.10.0 compatibility: limit_mm_per_prompt None
  -> {}
 
 Not a PRH change -- a pinned-version compatibility bug in this fork's

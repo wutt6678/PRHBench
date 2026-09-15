@@ -1,7 +1,7 @@
 From 9f70da2f5e89412ca03e46f112c25c630d71fcb2 Mon Sep 17 00:00:00 2001
 From: wutt6678 <wutt6678@gmail.com>
 Date: Tue, 15 Sep 2026 19:13:32 +0800
-Subject: [PATCH 3/4] Add PRH training-log instrumentation; fix
+Subject: [PATCH 3/5] Add PRH training-log instrumentation; fix
  post-termination reward bug
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

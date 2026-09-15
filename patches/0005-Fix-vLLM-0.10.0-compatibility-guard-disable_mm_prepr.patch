@@ -1,0 +1,69 @@
+From 2c815456c230313a2dec06a7c02badf730ab5ac8 Mon Sep 17 00:00:00 2001
+From: wutt6678 <wutt6678@gmail.com>
+Date: Tue, 15 Sep 2026 20:04:15 +0800
+Subject: [PATCH 5/5] Fix vLLM 0.10.0 compatibility: guard
+ disable_mm_preprocessor_cache
+
+Second vLLM 0.10.0 pydantic-strictness issue found in the same GPU Gate
+1 run, right after the limit_mm_per_prompt fix cleared the first one:
+vllm.config.ModelConfig raises "`disable_mm_preprocessor_cache` is only
+supported for multimodal models" if that flag is set at all for a
+text-only model -- and vllm_rollout_spmd.py passed
+disable_mm_preprocessor_cache=True unconditionally, regardless of
+whether the model is multimodal.
+
+Checked vLLM's ModelConfig source directly for the full set of
+multimodal-only flags it validates this way
+(limit_mm_per_prompt/mm_processor_kwargs/disable_mm_preprocessor_cache/
+interleave_mm_strings): verl only ever passes the first two of those,
+limit_mm_per_prompt is already `{}` (falsy, so it doesn't trigger its
+own "only supported for multimodal" check) when not multimodal, and now
+disable_mm_preprocessor_cache is only included in the LLM(...) kwargs
+when limit_images was actually configured (i.e. the model IS
+multimodal). No other latent issue from this validator.
+---
+ .../rollout/vllm_rollout/vllm_rollout_spmd.py        | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index f52ec37..7093f29 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -141,8 +141,18 @@ class vLLMRollout(BaseRollout):
+         # (no multimodal limit applied) and is accepted by every vLLM
+         # version that matters here, so use that instead of None.
+         limit_mm_per_prompt = {}
++        is_multimodal = False
+         if config.get("limit_images", None):  # support for multi-image data
+             limit_mm_per_prompt = {"image": config.get("limit_images")}
++            is_multimodal = True
++
++        # Likewise, vllm==0.10.0's ModelConfig validates
++        # `disable_mm_preprocessor_cache` is only accepted for multimodal
++        # models -- passing it (even as True) for a text-only model like
++        # the safety-gridworld setup raises: "Value error,
++        # `disable_mm_preprocessor_cache` is only supported for multimodal
++        # models." So only include it when the model actually is one.
++        mm_preprocessor_kwargs = {"disable_mm_preprocessor_cache": True} if is_multimodal else {}
+ 
+         lora_kwargs = kwargs.pop('lora_kwargs', {})
+         self.lora_kwargs = lora_kwargs
+@@ -162,7 +172,6 @@ class vLLMRollout(BaseRollout):
+             enforce_eager=config.enforce_eager,
+             gpu_memory_utilization=config.gpu_memory_utilization,
+             disable_custom_all_reduce=True,
+-            disable_mm_preprocessor_cache=True,
+             limit_mm_per_prompt=limit_mm_per_prompt,
+             skip_tokenizer_init=False,
+             max_model_len=max_model_len,
+@@ -173,6 +182,7 @@ class vLLMRollout(BaseRollout):
+             enable_prefix_caching=True,
+             trust_remote_code=trust_remote_code,
+             seed=config.get("seed", 0),
++            **mm_preprocessor_kwargs,
+             **lora_kwargs,
+             **engine_kwargs,
+         )
+-- 
+2.43.0
+
