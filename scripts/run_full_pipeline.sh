@@ -70,7 +70,10 @@ fi
 MIN_FREE_MIB="${MIN_FREE_MIB:-20000}"       # ~20 GiB: comfortable margin above the
                                              # ~14 GiB peak a successful phase actually used
 GPU_POLL_INTERVAL_SECONDS="${GPU_POLL_INTERVAL_SECONDS:-60}"
-GPU_MAX_WAIT_SECONDS="${GPU_MAX_WAIT_SECONDS:-1800}"  # give up waiting after 30 min, proceed anyway
+# GPU_MAX_WAIT_SECONDS=0 (the default) means wait indefinitely for a GPU
+# to reach MIN_FREE_MIB free -- set a positive value to give up after
+# that many seconds and proceed with whatever's best instead.
+GPU_MAX_WAIT_SECONDS="${GPU_MAX_WAIT_SECONDS:-0}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"           # retries specifically for the CUDA-OOM signature
 RETRY_BACKOFF_SECONDS="${RETRY_BACKOFF_SECONDS:-60}"
 
@@ -89,9 +92,10 @@ best_gpu_and_free_mib() {
 
 select_gpu_for_stage() {
   # Sets CUDA_VISIBLE_DEVICES for the next attempt. If AUTO_GPU=true,
-  # waits (polling all 4 GPUs) until one shows >= MIN_FREE_MIB free, up
-  # to GPU_MAX_WAIT_SECONDS, then proceeds with the best available
-  # regardless (logged clearly either way) rather than waiting forever.
+  # waits (polling all 4 GPUs) until one shows >= MIN_FREE_MIB free.
+  # With GPU_MAX_WAIT_SECONDS=0 (the default), this waits indefinitely;
+  # set it positive to give up after that many seconds and proceed with
+  # whatever's best instead.
   local stage_name="$1"
   if [ "${AUTO_GPU}" != "true" ]; then
     export CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}"
@@ -106,11 +110,13 @@ select_gpu_for_stage() {
     if [ "${best_free}" -ge "${MIN_FREE_MIB}" ]; then
       break
     fi
-    if [ "${waited}" -ge "${GPU_MAX_WAIT_SECONDS}" ]; then
+    if [ "${GPU_MAX_WAIT_SECONDS}" -gt 0 ] && [ "${waited}" -ge "${GPU_MAX_WAIT_SECONDS}" ]; then
       log "${stage_name}: no GPU reached ${MIN_FREE_MIB} MiB free after ${waited}s of waiting; proceeding with GPU ${best_idx} (${best_free} MiB free) anyway."
       break
     fi
-    log "${stage_name}: no GPU has ${MIN_FREE_MIB} MiB free yet (best: GPU ${best_idx} with ${best_free} MiB); waiting ${GPU_POLL_INTERVAL_SECONDS}s (${waited}s/${GPU_MAX_WAIT_SECONDS}s elapsed)..."
+    local wait_limit_desc="${GPU_MAX_WAIT_SECONDS}s"
+    [ "${GPU_MAX_WAIT_SECONDS}" -eq 0 ] && wait_limit_desc="no limit"
+    log "${stage_name}: no GPU has ${MIN_FREE_MIB} MiB free yet (best: GPU ${best_idx} with ${best_free} MiB); waiting ${GPU_POLL_INTERVAL_SECONDS}s (${waited}s elapsed, ${wait_limit_desc})..."
     sleep "${GPU_POLL_INTERVAL_SECONDS}"
     waited=$((waited + GPU_POLL_INTERVAL_SECONDS))
   done
