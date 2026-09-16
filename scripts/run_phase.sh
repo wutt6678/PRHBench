@@ -76,6 +76,32 @@ RESUME_FROM="${RESUME_FROM:-}"
 DETERMINISTIC_VAL="${DETERMINISTIC_VAL:-true}"
 export SHARED_GPU_COMPAT="${SHARED_GPU_COMPAT:-true}"
 
+# Conda env holding the full training stack (vllm + gridworlds + upstream
+# editable install; see scripts/setup_training_env.sh). Activated here,
+# in this process, rather than relying on grpo_train.sh's own
+# `source ~/.bashrc; conda activate` -- that line is a no-op when this
+# script is launched non-interactively (e.g. via nohup), because
+# ~/.bashrc's own "if not running interactively, don't do anything" guard
+# returns before ever reaching the conda init block, so the `conda`
+# shell function is never defined and activation silently fails with
+# "CondaError: Run 'conda init' before 'conda activate'". Activating here
+# instead updates PATH in this process, which bash *does* propagate to
+# the `bash grpo_train.sh` child below (PATH is inherited; only shell
+# functions are not) -- so grpo_train.sh's own activation attempt is
+# passed CONDA_ENV="" to skip it outright rather than depend on it
+# harmlessly no-op-ing.
+TRAIN_CONDA_ENV="${TRAIN_CONDA_ENV:-prhbench-train}"
+if [ -n "${TRAIN_CONDA_ENV}" ]; then
+  CONDA_BASE="$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")"
+  # shellcheck disable=SC1091
+  source "${CONDA_BASE}/etc/profile.d/conda.sh"
+  conda activate "${TRAIN_CONDA_ENV}"
+  if [ "${CONDA_DEFAULT_ENV:-}" != "${TRAIN_CONDA_ENV}" ]; then
+    echo "ERROR: failed to activate conda env '${TRAIN_CONDA_ENV}' (CONDA_DEFAULT_ENV=${CONDA_DEFAULT_ENV:-<unset>})" >&2
+    exit 1
+  fi
+fi
+
 if [ -z "${START_STEP}" ]; then
   if [ -n "${RESUME_FROM}" ] && [[ "${RESUME_FROM}" =~ global_step_([0-9]+)$ ]]; then
     START_STEP="${BASH_REMATCH[1]}"
@@ -160,4 +186,5 @@ SEED="${SEED}" \
 N_GPUS="${N_GPUS}" \
 PROJECT_NAME="${PROJECT_NAME}" \
 EXPERIMENT_NAME="${EXPERIMENT_NAME}" \
+CONDA_ENV="" \
 bash grpo_train.sh "${EXTRA_ARGS[@]}" "$@"
