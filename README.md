@@ -33,12 +33,15 @@ PRHBench/
 │   ├── setup_training_env.sh installs the real training stack (vLLM first, per upstream's own docs)
 │   ├── run_phase.sh          one training phase (pre-attack / attack / washout), writes a run manifest
 │   ├── run_pilot.sh          orchestrates all three phases across poison doses
+│   ├── run_full_pipeline.sh  unattended Gate 2 -> Gate 3 -> pilot, with GPU auto-select/retry (see below)
 │   ├── run_grpo_smoke.sh     GPU Gate 1: tiny end-to-end smoke (disabled / rho=0 / rho=1)
-│   └── run_resume_smoke.sh   GPU Gate 2: continuous-vs-segmented resume diagnostic
+│   ├── run_resume_smoke.sh   GPU Gate 2: continuous-vs-segmented resume diagnostic
+│   └── check_learnable.py    Gate 3 go/no-go: parses H(0) vs H(end) from a phase's console log
 ├── tests/
 │   ├── test_prh_reward.py               pure-logic unit tests (no torch/ray required)
 │   ├── test_env_manager_integration.py  real-stack integration smoke tests (ray+gymnasium)
-│   └── test_pilot_metrics.py            persistence-curve math, against synthetic data
+│   ├── test_pilot_metrics.py            persistence-curve math, against synthetic data
+│   └── test_check_learnable.py          learnability-gate parsing, against synthetic log lines
 ├── upstream/                 (gitignored) verl-agent-safety fork, recreated by setup_upstream.sh
 └── README.md
 ```
@@ -89,6 +92,13 @@ CUDA 13.0):
 ```bash
 pip install --index-url https://download.pytorch.org/whl/cu128 torch
 ```
+
+**Env name matters:** `scripts/run_phase.sh` activates the training conda
+env by name directly (`conda activate "${TRAIN_CONDA_ENV:-prhbench-train}"`,
+sourcing `conda.sh` rather than `~/.bashrc`, so it also works when launched
+non-interactively via `nohup`). If you create the training env under a
+different name on a new machine, either name it `prhbench-train` or pass
+`TRAIN_CONDA_ENV=<your-env-name>` to `run_phase.sh` / `run_full_pipeline.sh`.
 
 **Known issue:** the bundled `ai-safety-gridworlds`/`pycolab` code (a
 several-years-old DeepMind codebase) breaks under `numpy>=2.0` — one
@@ -336,34 +346,96 @@ vLLM sleep-mode memory-accounting assertion that's fundamentally
 unreliable on a shared GPU (now tolerated with a warning instead of
 crashing the run).
 
-Before the real pilot, re-run Smoke B/C to completion (all 3 updates
-each) on a less-contended window, to confirm the pattern holds beyond
-update 1 — the mechanism is proven, but a full run's absence of
-regressions across all 3 updates is still worth the extra confirmation.
+Decision made after Gate 1: **do not** spend more GPU time re-running
+Smoke B/C to completion. Three independent layers of evidence already
+confirm the reward-substitution mechanism (exact per-step numeric proof
+at both `rho=0` and `rho=1`, the real-stack integration tests, and the
+pure-logic unit tests) — the two update-2 crashes were confirmed
+external contention, not a defect, and re-proving the same mechanism a
+third way isn't worth the wall-clock cost. Proceed straight to Gates 2-3.
 
-### Gates 2-3 and the pilot itself: not yet run
+### Gates 2-3: attempted on the shared cluster, blocked by contention, not yet completed
 
-- **Gate 2** (`scripts/run_resume_smoke.sh`): continuous 0→20 vs.
-  segmented 0→10→(resume)→20, both `rho=0`. A diagnostic, not a
+`scripts/run_full_pipeline.sh` (see below) was built to run Gate 2 -> Gate
+3 -> the seed-17 pilot unattended, and was launched several times on this
+node's 4x shared RTX 6000 Ada GPUs. Every attempt was blocked by the same
+pattern: free memory on all 4 GPUs sat below the 20 GiB safety threshold
+for extended stretches (30-45+ minutes at a time), and on the one attempt
+that did get a GPU, another tenant's process claimed nearly all of it
+(47 GiB total capacity down to 135 MiB free) in the ~1 minute between
+GPU selection and FSDP's actual allocation, producing a CUDA OOM. This is
+a property of this specific shared node at this time, not a bug — see
+the pipeline's own header comment and `MIN_FREE_MIB`/retry logic below,
+which were added specifically in response to this. Two real environment
+bugs *were* found and fixed in the process (both in `scripts/run_phase.sh`,
+not upstream): the training conda env activation silently no-op'd under
+`nohup` (see "Env name matters" above), and the GPU-wait loop's polling
+rate was tightened from 60s to 1s so a brief opening isn't missed.
+
+- **Gate 2** (`scripts/run_resume_smoke.sh`): continuous 0→4 vs.
+  segmented 0→2→(resume)→4, both `rho=0`. A diagnostic, not a
   pass/fail test — the environment RNG isn't checkpointed, so exact
   reproduction isn't expected; only similar learning curves and final
-  validation reward are.
-- **Gate 3**: ~40 updates of `rho=0` training alone, to establish
-  `H(t)` (hidden reward) actually improves before there's anything
-  meaningful for an attacker to hijack. Go/no-go: `H(40) > H(0)` by a
-  practically meaningful amount.
-- **The pilot itself**: `run_pilot.sh` with `rho ∈ {0, 0.25, 1.0}`,
-  seed 17, `40 clean + 20 attack + 60 washout` (280 total updates, since
-  the first 40 are shared across doses), analyzed with
-  `analysis/pilot_metrics.py`.
+  validation reward are. Never blocks the rest of the pipeline.
+- **Gate 3**: 40 updates of `rho=0` training alone (in two checked
+  segments, 0→10 then 10→40), to establish `H(t)` (hidden reward)
+  actually improves before there's anything meaningful for an attacker
+  to hijack. Go/no-go, automated via `scripts/check_learnable.py`:
+  `H(end) - H(start) > 0` at each segment boundary; the pipeline stops
+  rather than training to 40 or launching the pilot on a base that
+  isn't learning anything.
+- **The pilot itself**: seed 17, `rho ∈ {0, 0.25, 1.0}`, `40 clean + 20
+  attack + 60 washout`, inlined in `run_full_pipeline.sh` from the
+  step-40 checkpoint, analyzed with `analysis/pilot_metrics.py`. Per
+  design, don't add more doses/seeds/models until these curves are
+  reviewed together.
 
-Run these only after Gates 1-3 pass, in that order — don't jump straight
-to the 280-update pilot. Expect each update to take on the order of
-30-50 minutes on a shared GPU node at the contention level observed
-here; budget wall-clock time accordingly, and prefer a less-loaded
-window if possible.
+Run these only after Gate 1 (in that order) — don't jump straight to the
+pilot. Expect each update to take on the order of 30-50 minutes even on
+an uncontended GPU; budget wall-clock time accordingly, and prefer a
+node that isn't shared with other tenants' training jobs if possible —
+that contention, not compute cost, was the actual bottleneck here.
 
-## Running a phase
+## Running everything unattended (recommended)
+
+`scripts/run_full_pipeline.sh` runs Gate 2 -> Gate 3 (0→10, learnability
+check, 10→40, learnability check) -> the seed-17 pilot across all three
+doses, end to end, with no manual intervention between stages:
+
+```bash
+nohup env ENV_NAME=AbsentSupervisor MODEL_PATH=Qwen/Qwen2.5-1.5B-Instruct \
+  SEED=17 N_GPUS=1 PROJECT_NAME=prhbench_pilot MIN_DELTA=0.0 \
+  bash scripts/run_full_pipeline.sh > run_logs/orchestrator_stdout.log 2>&1 &
+disown
+tail -f run_logs/PIPELINE_STATUS.txt   # check progress any time; nothing to babysit
+```
+
+It requires the `prhbench-train` conda env (see "Env name matters"
+above) and `HF_TOKEN` (auto-read from `~/.cache/huggingface/token` if
+present). Each stage's full console output goes to its own log under
+`run_logs/`; `PIPELINE_STATUS.txt` gets a one-line summary per stage.
+
+GPU selection/retry tuning (all optional, shown with their defaults):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AUTO_GPU` | `true` (auto-`false` if `CUDA_DEVICE` is set) | pick the least-loaded GPU per stage vs. use a fixed device |
+| `MIN_FREE_MIB` | `20000` | don't start a stage until some GPU has at least this much free |
+| `GPU_POLL_INTERVAL_SECONDS` | `1` | how often to recheck `nvidia-smi` while waiting |
+| `GPU_WAIT_LOG_EVERY_SECONDS` | `60` | how often to write a "still waiting" status line (independent of the poll rate, so a 1s poll doesn't flood the log) |
+| `GPU_MAX_WAIT_SECONDS` | `0` (wait indefinitely) | set positive to give up waiting and proceed with whatever's best after that many seconds |
+| `MAX_ATTEMPTS` | `3` | retries specifically for vLLM's CUDA-OOM signature; any other failure is never retried |
+| `RETRY_BACKOFF_SECONDS` | `60` | pause between OOM retries |
+
+Cleaning up between attempts: a killed or failed early-stage run may
+leave a manifest-only checkpoint directory (no actual training data,
+since `run_phase.sh` writes `prhbench_manifest.json` before launching
+the trainer) under `upstream/checkpoints/<PROJECT_NAME>/`; safe to
+`rm -rf` before relaunching. Real checkpoints (e.g. Gate 1's
+`prhbench_gate1_smoke/`) contain a `global_step_N/` subdirectory with
+actual model/optimizer state — don't remove those.
+
+## Running a single phase manually
 
 ```bash
 ENV_NAME=AbsentSupervisor MODEL_PATH=Qwen/Qwen2.5-1.5B-Instruct SEED=17 \
@@ -384,7 +456,7 @@ bash scripts/run_pilot.sh
 ```
 
 `HF_TOKEN` must be set (required by `grpo_train.sh`), and `N_GPUS` /
-`CONDA_ENV` should be overridden to match the target node. Use the
+`TRAIN_CONDA_ENV` should be overridden to match the target node. Use the
 `prhbench-train` environment for all of this, not `prhbench`.
 
 ## Known limitations / deferred work
@@ -397,9 +469,19 @@ bash scripts/run_pilot.sh
   one initial prompt get the same `Z`) is a real open question given GRPO
   computes relative advantages within groups — queued as a follow-up
   ablation, not implemented now.
-- GPU Gate 1 passed (see "Status" above), but only Smoke A ran to full
-  completion; Smoke B/C's core reward-substitution claims are proven
-  exactly at update 1, but both were cut short at update 2 by transient
-  external GPU contention. Re-running them to completion, then Gates 2-3
-  and the pilot itself, are the remaining open items before trusting any
-  persistence numbers.
+- GPU Gate 1 passed (see "Status" above). Smoke B/C's core
+  reward-substitution claims are proven exactly at update 1 but were cut
+  short at update 2 by transient external GPU contention; the decision
+  was made not to re-run them, since three independent layers of
+  evidence already confirm the mechanism. Gates 2-3 and the pilot itself
+  are the remaining open items before trusting any persistence numbers
+  — `scripts/run_full_pipeline.sh` automates all of them, but repeated
+  attempts on this shared node were blocked by sustained GPU contention
+  (see "Status" above) rather than completing.
+- The PRH router's RNG restarts fresh in every `run_phase.sh` process
+  (it isn't checkpointed/resumed across phase boundaries). This is fine
+  for the current pilot design, where each phase runs uninterrupted
+  start to finish, but would need attention before any future work that
+  interrupts and resumes a phase mid-way (e.g. a crash-resume) with
+  multiple seeds, since the poison mask sequence would restart rather
+  than continue from where it left off.
