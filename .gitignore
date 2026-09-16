@@ -17,3 +17,4 @@ __pycache__/
 checkpoints/
 wandb/
 *.log
+run_logs/

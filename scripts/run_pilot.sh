@@ -114,7 +114,7 @@ else
     START_STEP=0 \
     PRH_ENABLED=true \
     PRH_POISON_PROB=0.0 \
-    bash "${HERE}/run_phase.sh"
+    bash "${HERE}/run_phase.sh" "$@"
 fi
 
 for dose in ${DOSES}; do
@@ -132,7 +132,7 @@ for dose in ${DOSES}; do
     PRH_ENABLED=true \
     PRH_POISON_PROB="${dose}" \
     RESUME_FROM="${pre_ckpt}" \
-    bash "${HERE}/run_phase.sh"
+    bash "${HERE}/run_phase.sh" "$@"
 
   echo "############################################################"
   echo "# Phase 3/3 -- washout (rho=0, seed=${SEED}, following dose=${dose})"
@@ -144,7 +144,7 @@ for dose in ${DOSES}; do
     PRH_ENABLED=true \
     PRH_POISON_PROB=0.0 \
     RESUME_FROM="${attack_ckpt}" \
-    bash "${HERE}/run_phase.sh"
+    bash "${HERE}/run_phase.sh" "$@"
 done
 
 echo "All phases submitted for seed=${SEED}, doses=[${DOSES}]."
