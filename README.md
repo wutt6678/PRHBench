@@ -1,6 +1,6 @@
 # PRHBench
 
-Pilot implementation of **Poisoned Reward Hijacking (PRH)**: an episode-level
+Pilot implementation of **Persistent Reward Hijacking (PRH)**: an episode-level
 Bernoulli substitution of an RL agent's hidden safety reward with an
 observed proxy reward, on top of the [`asparius/verl-agent-safety`](https://github.com/asparius/verl-agent-safety)
 fork of verl-agent (the code for "Reward Hacking in Language Model Agents:

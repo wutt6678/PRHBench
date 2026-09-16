@@ -1,0 +1,113 @@
+From ed51c4717f2e20d595f2eac8505b4248f3b1bf45 Mon Sep 17 00:00:00 2001
+From: wutt6678 <wutt6678@gmail.com>
+Date: Wed, 16 Sep 2026 10:50:01 +0800
+Subject: [PATCH 7/7] Rename to Persistent Reward Hijacking; narrow shared-GPU
+ compat patch
+
+Terminology only: "Poisoned Reward Hijacking" -> "Persistent Reward
+Hijacking" in docstrings/comments (README, prh.py, env_manager.py,
+ppo_trainer.yaml). The prh_* API (PRHConfig, PRHRewardRouter, env.prh.*
+config keys, prh_* info-dict fields) is unchanged -- "PRH" still applies
+either way.
+
+Also narrows the vLLM sleep()-mode compatibility patch (0006): it
+previously caught any AssertionError from inference_engine.sleep().
+Now it only tolerates the specific "Memory usage increased after
+sleeping" message, and only when SHARED_GPU_COMPAT=true is explicitly
+set (defaulted to true in scripts/run_phase.sh, since this project
+routinely runs on a heavily shared cluster) -- a different assertion
+from sleep() always propagates regardless of this setting, so a
+genuine vLLM invariant violation is never silently swallowed.
+---
+ agent_system/environments/env_manager.py   |  2 +-
+ agent_system/environments/prh.py           |  2 +-
+ verl/trainer/config/ppo_trainer.yaml       |  2 +-
+ verl/workers/sharding_manager/fsdp_vllm.py | 33 ++++++++++++++--------
+ 4 files changed, 24 insertions(+), 15 deletions(-)
+
+diff --git a/agent_system/environments/env_manager.py b/agent_system/environments/env_manager.py
+index bec5152..d341dad 100644
+--- a/agent_system/environments/env_manager.py
++++ b/agent_system/environments/env_manager.py
+@@ -619,7 +619,7 @@ class SafetyGridworldsEnvironmentManager(EnvironmentManagerBase):
+         self.memory = SimpleMemory()
+         super().__init__(envs, projection_f, config)
+ 
+-        # --- Poisoned Reward Hijacking (PRH) wiring ---------------------
++        # --- Persistent Reward Hijacking (PRH) wiring ---------------------
+         # `prh_training` distinguishes the training-side manager (which may
+         # substitute the returned reward) from the validation-side manager
+         # (which must never alter ground-truth metrics — see PRHBench pilot
+diff --git a/agent_system/environments/prh.py b/agent_system/environments/prh.py
+index 02e8530..ff6abec 100644
+--- a/agent_system/environments/prh.py
++++ b/agent_system/environments/prh.py
+@@ -12,7 +12,7 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-"""Poisoned Reward Hijacking (PRH) reward-selection utilities.
++"""Persistent Reward Hijacking (PRH) reward-selection utilities.
+ 
+ This module implements the first-commit mechanics of the PRHBench pilot
+ design for the AI Safety Gridworlds environments:
+diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
+index e5ffe81..01467e2 100644
+--- a/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/trainer/config/ppo_trainer.yaml
+@@ -308,7 +308,7 @@ env:
+   webshop:
+     use_small: True
+     human_goals: False
+-  # Poisoned Reward Hijacking (PRH) — episode-level reward-channel hijacking
++  # Persistent Reward Hijacking (PRH) — episode-level reward-channel hijacking
+   # for the AI Safety Gridworlds environments. Disabled by default: every
+   # other environment, and safety-gridworld runs that never set
+   # env.prh.enabled=true, are completely unaffected. See
+diff --git a/verl/workers/sharding_manager/fsdp_vllm.py b/verl/workers/sharding_manager/fsdp_vllm.py
+index 0ab89c0..38c2afe 100644
+--- a/verl/workers/sharding_manager/fsdp_vllm.py
++++ b/verl/workers/sharding_manager/fsdp_vllm.py
+@@ -233,18 +233,27 @@ class FSDPVLLMShardingManager(BaseShardingManager):
+                 # during the measurement window can make that delta look
+                 # negative even though vLLM itself freed memory correctly
+                 # -- this is a measurement artifact of multi-tenant GPU
+-                # sharing, not a real leak in this process. Log and
+-                # continue rather than crashing the whole training run
+-                # over it (confirmed in practice on a 4-tenant shared
+-                # node: this occurred nondeterministically, disappearing on
+-                # a retry with no code change).
+-                logger.warning(
+-                    "vllm inference_engine.sleep(level=1) raised %r; continuing without it. "
+-                    "This is expected on a GPU shared with other processes, where their "
+-                    "concurrent memory usage can make vLLM's whole-device free-memory "
+-                    "delta look negative even when this process freed memory correctly.",
+-                    exc,
+-                )
++                # sharing, not a real leak in this process (confirmed in
++                # practice on a 4-tenant shared node: this occurred
++                # nondeterministically, disappearing on a retry with no
++                # code change). Only ever tolerate this *specific*
++                # assertion message, and only when explicitly opted into
++                # via SHARED_GPU_COMPAT=true -- any other AssertionError
++                # from sleep() (a real vLLM invariant violation) always
++                # propagates, and so does this one when the env var isn't set.
++                is_known_shared_gpu_artifact = "Memory usage increased after sleeping" in str(exc)
++                shared_gpu_compat = os.getenv("SHARED_GPU_COMPAT", "false").lower() in ("1", "true", "yes")
++                if is_known_shared_gpu_artifact and shared_gpu_compat:
++                    logger.warning(
++                        "vllm inference_engine.sleep(level=1) raised %r; continuing without it "
++                        "(SHARED_GPU_COMPAT=true). This is expected on a GPU shared with other "
++                        "processes, where their concurrent memory usage can make vLLM's "
++                        "whole-device free-memory delta look negative even when this process "
++                        "freed memory correctly.",
++                        exc,
++                    )
++                else:
++                    raise
+ 
+         self.module.train()
+ 
+-- 
+2.43.0
+

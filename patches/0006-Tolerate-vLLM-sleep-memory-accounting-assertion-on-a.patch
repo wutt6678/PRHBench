@@ -1,7 +1,7 @@
 From aca633211f77bb97c5d29c59439e6d9f25027a48 Mon Sep 17 00:00:00 2001
 From: wutt6678 <wutt6678@gmail.com>
 Date: Tue, 15 Sep 2026 21:15:40 +0800
-Subject: [PATCH 6/6] Tolerate vLLM sleep() memory-accounting assertion on a
+Subject: [PATCH 6/7] Tolerate vLLM sleep() memory-accounting assertion on a
  shared GPU
 
 Not a PRH change -- found running GPU Gate 1 on this shared 4-GPU node.

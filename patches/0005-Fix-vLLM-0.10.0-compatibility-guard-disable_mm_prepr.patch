@@ -1,7 +1,7 @@
 From 2c815456c230313a2dec06a7c02badf730ab5ac8 Mon Sep 17 00:00:00 2001
 From: wutt6678 <wutt6678@gmail.com>
 Date: Tue, 15 Sep 2026 20:04:15 +0800
-Subject: [PATCH 5/6] Fix vLLM 0.10.0 compatibility: guard
+Subject: [PATCH 5/7] Fix vLLM 0.10.0 compatibility: guard
  disable_mm_preprocessor_cache
 
 Second vLLM 0.10.0 pydantic-strictness issue found in the same GPU Gate

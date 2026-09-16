@@ -33,6 +33,14 @@
 # validation removes sampling noise from the persistence curve; a
 # stochastic-evaluation sensitivity check (e.g. n=4) is a follow-up, not
 # part of the first pilot.
+#
+# SHARED_GPU_COMPAT=true (the default here) tells the vLLM/FSDP sharding
+# manager to tolerate vLLM's sleep()-mode "Memory usage increased after
+# sleeping" assertion, which is a measurement artifact on a GPU shared
+# with other tenants' processes, not a real leak (see patches/0006). Set
+# SHARED_GPU_COMPAT=false if running on a dedicated, unshared GPU where
+# you'd rather that assertion crash loudly (any *other* AssertionError
+# from sleep() always propagates regardless of this setting).
 
 set -euo pipefail
 
@@ -66,6 +74,7 @@ PRH_STRICT_HIDDEN_REWARD="${PRH_STRICT_HIDDEN_REWARD:-true}"
 RESUME_FROM="${RESUME_FROM:-}"
 
 DETERMINISTIC_VAL="${DETERMINISTIC_VAL:-true}"
+export SHARED_GPU_COMPAT="${SHARED_GPU_COMPAT:-true}"
 
 if [ -z "${START_STEP}" ]; then
   if [ -n "${RESUME_FROM}" ] && [[ "${RESUME_FROM}" =~ global_step_([0-9]+)$ ]]; then
@@ -108,7 +117,7 @@ echo "=== PRHBench phase: ${EXPERIMENT_NAME} (phase=${PHASE_NAME}) ==="
 echo "    env=${ENV_NAME} model=${MODEL_PATH} seed=${SEED}"
 echo "    prh.enabled=${PRH_ENABLED} prh.poison_prob=${PRH_POISON_PROB} prh.poison_seed=${PRH_POISON_SEED}"
 echo "    start_step=${START_STEP} total_epochs=${TOTAL_EPOCHS} resume_from=${RESUME_FROM:-<none, fresh start>}"
-echo "    deterministic_val=${DETERMINISTIC_VAL}"
+echo "    deterministic_val=${DETERMINISTIC_VAL} shared_gpu_compat=${SHARED_GPU_COMPAT}"
 
 # --- Run manifest -----------------------------------------------------
 # Written before training starts (so it exists even if the run is later
@@ -137,6 +146,7 @@ cat > "${CKPTS_DIR}/prhbench_manifest.json" <<EOF
   "poison_seed": ${PRH_POISON_SEED},
   "env_seed": ${SEED},
   "deterministic_val": ${DETERMINISTIC_VAL},
+  "shared_gpu_compat": ${SHARED_GPU_COMPAT},
   "n_gpus": ${N_GPUS},
   "created_at": "${RUN_TIMESTAMP}"
 }
