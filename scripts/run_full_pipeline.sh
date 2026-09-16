@@ -69,11 +69,16 @@ if [ -n "${CUDA_DEVICE}" ]; then
 fi
 MIN_FREE_MIB="${MIN_FREE_MIB:-20000}"       # ~20 GiB: comfortable margin above the
                                              # ~14 GiB peak a successful phase actually used
-GPU_POLL_INTERVAL_SECONDS="${GPU_POLL_INTERVAL_SECONDS:-60}"
+GPU_POLL_INTERVAL_SECONDS="${GPU_POLL_INTERVAL_SECONDS:-1}"
 # GPU_MAX_WAIT_SECONDS=0 (the default) means wait indefinitely for a GPU
 # to reach MIN_FREE_MIB free -- set a positive value to give up after
 # that many seconds and proceed with whatever's best instead.
 GPU_MAX_WAIT_SECONDS="${GPU_MAX_WAIT_SECONDS:-0}"
+# The GPU check itself runs every GPU_POLL_INTERVAL_SECONDS (so a brief
+# opening is caught almost immediately), but the "still waiting" log line
+# is throttled to once per GPU_WAIT_LOG_EVERY_SECONDS so a 1s poll interval
+# doesn't flood PIPELINE_STATUS.txt with one line per second.
+GPU_WAIT_LOG_EVERY_SECONDS="${GPU_WAIT_LOG_EVERY_SECONDS:-60}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"           # retries specifically for the CUDA-OOM signature
 RETRY_BACKOFF_SECONDS="${RETRY_BACKOFF_SECONDS:-60}"
 
@@ -114,9 +119,11 @@ select_gpu_for_stage() {
       log "${stage_name}: no GPU reached ${MIN_FREE_MIB} MiB free after ${waited}s of waiting; proceeding with GPU ${best_idx} (${best_free} MiB free) anyway."
       break
     fi
-    local wait_limit_desc="${GPU_MAX_WAIT_SECONDS}s"
-    [ "${GPU_MAX_WAIT_SECONDS}" -eq 0 ] && wait_limit_desc="no limit"
-    log "${stage_name}: no GPU has ${MIN_FREE_MIB} MiB free yet (best: GPU ${best_idx} with ${best_free} MiB); waiting ${GPU_POLL_INTERVAL_SECONDS}s (${waited}s elapsed, ${wait_limit_desc})..."
+    if [ "$((waited % GPU_WAIT_LOG_EVERY_SECONDS))" -eq 0 ]; then
+      local wait_limit_desc="${GPU_MAX_WAIT_SECONDS}s"
+      [ "${GPU_MAX_WAIT_SECONDS}" -eq 0 ] && wait_limit_desc="no limit"
+      log "${stage_name}: no GPU has ${MIN_FREE_MIB} MiB free yet (best: GPU ${best_idx} with ${best_free} MiB); polling every ${GPU_POLL_INTERVAL_SECONDS}s (${waited}s elapsed, ${wait_limit_desc})..."
+    fi
     sleep "${GPU_POLL_INTERVAL_SECONDS}"
     waited=$((waited + GPU_POLL_INTERVAL_SECONDS))
   done
