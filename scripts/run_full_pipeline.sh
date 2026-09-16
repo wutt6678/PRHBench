@@ -44,13 +44,44 @@ ENV_NAME="${ENV_NAME:-AbsentSupervisor}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}"
 SEED="${SEED:-17}"
 N_GPUS="${N_GPUS:-1}"
-CUDA_DEVICE="${CUDA_DEVICE:-3}"
+CUDA_DEVICE="${CUDA_DEVICE:-}"
 PROJECT_NAME="${PROJECT_NAME:-prhbench_pilot}"
 MIN_DELTA="${MIN_DELTA:-0.0}"
+# AUTO_GPU=true (default): re-check nvidia-smi and pick whichever GPU has
+# the most free memory right before EACH stage below, rather than a single
+# fixed device for the whole pipeline. This is a point-in-time re-check at
+# stage boundaries, not continuous monitoring during a stage -- a stage
+# already running can still OOM if another tenant's usage grows mid-run
+# (this is exactly what killed the first attempt: GPU 2 had headroom when
+# picked, then another process filled it before vLLM's KV-cache init).
+# Set CUDA_DEVICE explicitly (a GPU index) to disable and pin one GPU for
+# the whole run instead.
+AUTO_GPU="${AUTO_GPU:-true}"
+if [ -n "${CUDA_DEVICE}" ]; then
+  AUTO_GPU="false"
+fi
 
 export HF_TOKEN="${HF_TOKEN:-$(cat "$HOME/.cache/huggingface/token" 2>/dev/null || true)}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
-export CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}"
+
+pick_gpu() {
+  # Prints the index of the GPU with the most free memory right now.
+  nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits \
+    | sort -t',' -k2 -n -r | head -1 | cut -d',' -f1 | tr -d ' '
+}
+
+select_gpu_for_stage() {
+  # Sets CUDA_VISIBLE_DEVICES for the next stage: freshly re-picked if
+  # AUTO_GPU=true, otherwise the fixed CUDA_DEVICE from above.
+  local stage_name="$1"
+  if [ "${AUTO_GPU}" = "true" ]; then
+    CUDA_DEVICE="$(pick_gpu)"
+  fi
+  export CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}"
+  local free_mib
+  free_mib="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "${CUDA_DEVICE}" 2>/dev/null || echo '?')"
+  log "${stage_name}: using GPU ${CUDA_DEVICE} (${free_mib} MiB free at selection time)"
+}
 
 # The memory-footprint overrides that got GPU Gate 1's Smoke A to fully
 # pass on this shared cluster (single GPU, eager mode, freed vLLM cache,
@@ -68,10 +99,11 @@ log() {
   echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a "${STATUS_FILE}"
 }
 
-log "=== PRHBench full pipeline starting (env=${ENV_NAME} model=${MODEL_PATH} seed=${SEED} gpu=${CUDA_DEVICE}) ==="
+log "=== PRHBench full pipeline starting (env=${ENV_NAME} model=${MODEL_PATH} seed=${SEED} gpu=$([ "${AUTO_GPU}" = "true" ] && echo "auto" || echo "${CUDA_DEVICE}")) ==="
 
 # --- Stage 1: short Gate 2 (diagnostic only, never blocks) -------------
 log "Stage 1/4: Gate 2 (short resume diagnostic, 0->4 / 0->2->4)"
+select_gpu_for_stage "Stage 1/4"
 GATE2_LOG="${LOG_DIR}/gate2_resume.log"
 CONDA_ENV="" N_GPUS="${N_GPUS}" SEED="${SEED}" ENV_NAME="${ENV_NAME}" MODEL_PATH="${MODEL_PATH}" \
   bash "${HERE}/run_resume_smoke.sh" "${MEM_ARGS[@]}" > "${GATE2_LOG}" 2>&1
@@ -85,6 +117,7 @@ fi
 
 # --- Stage 2: Gate 3 phase A, 0 -> 10 (fresh start) ---------------------
 log "Stage 2/4: Gate 3 pretraining, phase A: 0 -> 10 updates, rho=0"
+select_gpu_for_stage "Stage 2/4"
 GATE3_A_LOG="${LOG_DIR}/gate3_phaseA_0to10.log"
 CONDA_ENV="" N_GPUS="${N_GPUS}" SEED="${SEED}" ENV_NAME="${ENV_NAME}" MODEL_PATH="${MODEL_PATH}" \
 PROJECT_NAME="${PROJECT_NAME}" EXPERIMENT_NAME="pre_s${SEED}" PHASE_NAME="gate3_to10" \
@@ -115,6 +148,7 @@ log "Stage 2/4: LEARNABLE at step 10 -- proceeding to step 40."
 
 # --- Stage 3: Gate 3 phase B, 10 -> 40 (resume) --------------------------
 log "Stage 3/4: Gate 3 pretraining, phase B: 10 -> 40 updates, rho=0"
+select_gpu_for_stage "Stage 3/4"
 GATE3_B_LOG="${LOG_DIR}/gate3_phaseB_10to40.log"
 PRE_CKPT_10="${UPSTREAM_DIR}/checkpoints/${PROJECT_NAME}/pre_s${SEED}/global_step_10"
 CONDA_ENV="" N_GPUS="${N_GPUS}" SEED="${SEED}" ENV_NAME="${ENV_NAME}" MODEL_PATH="${MODEL_PATH}" \
@@ -145,18 +179,59 @@ fi
 log "Stage 3/4: LEARNABLE at step 40 -- ${PRE_CKPT_40} is the pilot's pre-attack checkpoint."
 
 # --- Stage 4: seed-17 PRH pilot, branching from theta_40 ----------------
+# Inlined (rather than delegating to run_pilot.sh) so each of the 6
+# attack/washout phases below gets its own fresh GPU pick via
+# select_gpu_for_stage -- the pilot is the longest, most crash-prone part
+# (each phase 20-60 real GPU-minutes), so re-checking only once for the
+# whole stage would barely improve on a single fixed pick.
 log "Stage 4/4: seed-17 pilot -- rho in {0, 0.25, 1.0}, 40 clean (reused) + 20 attack + 60 washout"
-PILOT_LOG="${LOG_DIR}/pilot_seed${SEED}.log"
-N_GPUS="${N_GPUS}" SEED="${SEED}" ENV_NAME="${ENV_NAME}" MODEL_PATH="${MODEL_PATH}" \
-PROJECT_NAME="${PROJECT_NAME}" SKIP_PRE=true PRE_EPOCHS=40 DOSES="0.0 0.25 1.0" \
-SAVE_FREQ=5 TEST_FREQ=5 \
-  bash "${HERE}/run_pilot.sh" "${MEM_ARGS[@]}" > "${PILOT_LOG}" 2>&1
-PILOT_EXIT=$?
-if [ ${PILOT_EXIT} -ne 0 ]; then
-  log "Stage 4/4: pilot exited ${PILOT_EXIT} (may be partial -- some doses may"
-  log "  have completed before the failure). See ${PILOT_LOG}."
+ATTACK_EPOCHS=60
+WASHOUT_EPOCHS=120
+DOSES="0.0 0.25 1.0"
+PILOT_FAILED=false
+for dose in ${DOSES}; do
+  attack_experiment="rho${dose}_s${SEED}"
+  washout_experiment="washout_rho${dose}_s${SEED}"
+  attack_ckpt="${UPSTREAM_DIR}/checkpoints/${PROJECT_NAME}/${attack_experiment}/global_step_${ATTACK_EPOCHS}"
+
+  select_gpu_for_stage "Stage 4/4 (rho=${dose} attack)"
+  ATTACK_LOG="${LOG_DIR}/pilot_rho${dose}_attack.log"
+  N_GPUS="${N_GPUS}" SEED="${SEED}" ENV_NAME="${ENV_NAME}" MODEL_PATH="${MODEL_PATH}" \
+  PROJECT_NAME="${PROJECT_NAME}" EXPERIMENT_NAME="${attack_experiment}" PHASE_NAME="attack" \
+  TOTAL_EPOCHS="${ATTACK_EPOCHS}" SAVE_FREQ=5 TEST_FREQ=5 \
+  PRH_ENABLED=true PRH_POISON_PROB="${dose}" PRH_POISON_SEED=10017 \
+  RESUME_FROM="${PRE_CKPT_40}" \
+    bash "${HERE}/run_phase.sh" "${MEM_ARGS[@]}" > "${ATTACK_LOG}" 2>&1
+  if [ $? -ne 0 ]; then
+    log "Stage 4/4: FAILED -- rho=${dose} attack phase exited non-zero. See ${ATTACK_LOG}."
+    PILOT_FAILED=true
+    continue
+  fi
+  log "Stage 4/4: rho=${dose} attack (40->${ATTACK_EPOCHS}) completed. See ${ATTACK_LOG}"
+
+  select_gpu_for_stage "Stage 4/4 (rho=${dose} washout)"
+  WASHOUT_LOG="${LOG_DIR}/pilot_rho${dose}_washout.log"
+  N_GPUS="${N_GPUS}" SEED="${SEED}" ENV_NAME="${ENV_NAME}" MODEL_PATH="${MODEL_PATH}" \
+  PROJECT_NAME="${PROJECT_NAME}" EXPERIMENT_NAME="${washout_experiment}" PHASE_NAME="washout" \
+  TOTAL_EPOCHS="${WASHOUT_EPOCHS}" SAVE_FREQ=5 TEST_FREQ=5 \
+  PRH_ENABLED=true PRH_POISON_PROB=0.0 PRH_POISON_SEED=10017 \
+  RESUME_FROM="${attack_ckpt}" \
+    bash "${HERE}/run_phase.sh" "${MEM_ARGS[@]}" > "${WASHOUT_LOG}" 2>&1
+  if [ $? -ne 0 ]; then
+    log "Stage 4/4: FAILED -- rho=${dose} washout phase exited non-zero. See ${WASHOUT_LOG}."
+    PILOT_FAILED=true
+    continue
+  fi
+  log "Stage 4/4: rho=${dose} washout (${ATTACK_EPOCHS}->${WASHOUT_EPOCHS}) completed. See ${WASHOUT_LOG}"
+done
+
+if [ "${PILOT_FAILED}" = "true" ]; then
+  log "Stage 4/4: one or more doses failed (see per-dose logs above) -- some may"
+  log "  have completed successfully regardless. Re-run just the failed"
+  log "  dose/phase manually (RESUME_FROM the last good checkpoint) rather"
+  log "  than the whole pipeline."
   exit 1
 fi
-log "Stage 4/4: seed-17 pilot completed. See ${PILOT_LOG}"
+log "Stage 4/4: seed-17 pilot completed for all doses [${DOSES}]."
 log "=== Pipeline complete. Analyze with analysis/pilot_metrics.py against"
 log "  the validation metrics logged under checkpoints/${PROJECT_NAME}/{rho*,washout_rho*}_s${SEED}. ==="
